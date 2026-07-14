@@ -351,6 +351,13 @@ plugins = [
   "**/plugin.yaml",
   "**/plugin.yml",
   "**/README.md",
+  # Research Protocol ships versioned runtime contracts and operational data.
+  # Keep these scoped to this plugin rather than broadening package-data for
+  # every bundled plugin.
+  "research_protocol/**/*.json",
+  "research_protocol/**/*.yaml",
+  "research_protocol/**/*.sql",
+  "research_protocol/**/*.md",
 ]
 
 [tool.setuptools.packages.find]
