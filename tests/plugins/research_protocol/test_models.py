@@ -102,9 +102,7 @@ def test_plan_v1_rejects_unknown_fields():
         ("objective", " Produce a reproducible offline evidence report."),
     ],
 )
-def test_strict_string_contracts_reject_instead_of_normalizing_whitespace(
-    field, value
-):
+def test_strict_string_contracts_reject_instead_of_normalizing_whitespace(field, value):
     payload = _plan_payload()
     payload[field] = value
 
@@ -288,7 +286,9 @@ def test_dedup_cluster_rejects_duplicate_members():
 
 
 def test_dedup_cluster_requires_canonical_member():
-    with pytest.raises(ValidationError, match="canonical provenance must be a cluster member"):
+    with pytest.raises(
+        ValidationError, match="canonical provenance must be a cluster member"
+    ):
         DedupCluster(
             schema_version="dedup_cluster.v1",
             **META,
@@ -414,4 +414,6 @@ def test_artifact_mappings_are_deeply_immutable_and_serializable():
     with pytest.raises(TypeError):
         run.policy_hashes["source_quality.v1"] = "not-a-sha"
 
-    assert load_artifact_from_json_bytes(RunConfig, run.to_canonical_json_bytes()) == run
+    assert (
+        load_artifact_from_json_bytes(RunConfig, run.to_canonical_json_bytes()) == run
+    )

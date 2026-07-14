@@ -145,4 +145,7 @@ def test_packaging_metadata_covers_all_research_protocol_data_channels():
 
     for suffix in ("*.json", "*.yaml", "*.sql", "*.md"):
         assert f'"research_protocol/**/*{suffix[1:]}"' in pyproject
-    assert "recursive-include plugins/research_protocol *.json *.yaml *.sql *.md" in manifest
+    assert (
+        "recursive-include plugins/research_protocol *.json *.yaml *.sql *.md"
+        in manifest
+    )

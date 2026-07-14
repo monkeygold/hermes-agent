@@ -44,21 +44,34 @@ def test_research_protocol_is_discovered_but_not_enabled_by_default(
     assert loaded.manifest.name == PLUGIN_KEY
     assert loaded.manifest.key == PLUGIN_KEY
     assert loaded.manifest.kind == "standalone"
+    assert loaded.manifest.version == "0.2.0"
+    assert set(loaded.manifest.provides_tools) == {
+        "plan_context_read",
+        "plan_artifact_write",
+        "plan_approval_request",
+    }
     assert loaded.enabled is False
     assert loaded.module is None
     assert "not enabled in config" in (loaded.error or "")
     _assert_no_runtime_registrations(loaded)
 
 
-def test_research_protocol_explicit_enable_loads_no_runtime_behavior(
+def test_research_protocol_explicit_enable_registers_exact_pr2_surface(
     tmp_path, monkeypatch
 ):
-    """The exact public key opts in, but the PR 0 entry point is a no-op."""
+    """The exact public key opts into only the three bounded planner tools."""
     loaded = _discover(tmp_path, monkeypatch, {"enabled": [PLUGIN_KEY]})
 
     assert loaded.enabled is True
     assert loaded.error is None
-    _assert_no_runtime_registrations(loaded)
+    assert set(loaded.tools_registered) == {
+        "plan_context_read",
+        "plan_artifact_write",
+        "plan_approval_request",
+    }
+    assert loaded.hooks_registered == []
+    assert loaded.middleware_registered == []
+    assert loaded.commands_registered == []
 
 
 @pytest.mark.parametrize("enabled", [None, "", {}, [], PLUGIN_KEY])
@@ -88,12 +101,84 @@ def test_research_protocol_disabled_list_has_priority(tmp_path, monkeypatch):
     _assert_no_runtime_registrations(loaded)
 
 
-def test_pr0_register_entry_point_cannot_touch_any_plugin_surface():
-    """The PR 0 entry point must remain a true no-op on every context API."""
+def test_pr2_register_entry_point_only_touches_tool_registration(
+    tmp_path,
+    monkeypatch,
+):
+    """PR2 must not gain hooks, middleware, commands, LLM, or other surfaces."""
     from plugins.research_protocol import register
 
-    class RejectEveryContextAccess:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("plugins: {}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    calls = []
+
+    class ToolOnlyContext:
+        def register_tool(self, **kwargs):
+            calls.append(kwargs)
+
         def __getattr__(self, name):
             pytest.fail(f"register() accessed plugin context surface {name!r}")
 
-    assert register(RejectEveryContextAccess()) is None
+    assert register(ToolOnlyContext()) is None
+    assert {call["name"] for call in calls} == {
+        "plan_context_read",
+        "plan_artifact_write",
+        "plan_approval_request",
+    }
+    assert {call["toolset"] for call in calls} == {"planner"}
+    assert all(call["is_async"] is True for call in calls)
+    assert all(call["check_fn"]() is False for call in calls)
+
+
+def test_register_reads_real_plugin_entry_config_without_opening_database(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins.research_protocol import register
+    from plugins.research_protocol.runtime import (
+        READER_DATABASE_URL_ENV,
+        WRITER_DATABASE_URL_ENV,
+    )
+
+    artifact_root = tmp_path / "artifacts"
+    hermes_home = tmp_path / "hermes-home"
+    _configure_plugins(
+        hermes_home,
+        {
+            "enabled": [PLUGIN_KEY],
+            "entries": {
+                PLUGIN_KEY: {
+                    "artifact_root": str(artifact_root),
+                }
+            },
+        },
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv(
+        READER_DATABASE_URL_ENV,
+        "postgresql://reader@localhost/research-reader",
+    )
+    monkeypatch.setenv(
+        WRITER_DATABASE_URL_ENV,
+        "postgresql://writer@localhost/research-writer",
+    )
+    calls = []
+
+    class ToolOnlyContext:
+        def register_tool(self, **kwargs):
+            calls.append(kwargs)
+
+        def __getattr__(self, name):
+            pytest.fail(f"register() accessed plugin context surface {name!r}")
+
+    register(ToolOnlyContext())
+
+    assert artifact_root.is_dir()
+    assert {call["name"] for call in calls} == {
+        "plan_context_read",
+        "plan_artifact_write",
+        "plan_approval_request",
+    }
+    assert all(call["check_fn"]() is True for call in calls)

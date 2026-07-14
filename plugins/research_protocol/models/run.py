@@ -54,7 +54,7 @@ class ManifestRecord(ArtifactModel):
         json_schema_extra={
             "pattern": SAFE_RELATIVE_POSIX_PATTERN,
             "$comment": PATH_BOUNDARY_COMMENT,
-        }
+        },
     )
     sha256: Sha256
     byte_length: int = Field(strict=True, ge=0)
