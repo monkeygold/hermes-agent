@@ -342,13 +342,15 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
 
     # Try to identify our unit name and ask systemctl for its config.
     unit_name: Optional[str] = None
+    cgroup_path: Optional[str] = None
     try:
         # /proc/self/cgroup gives us "0::/user.slice/.../hermes-gateway.service"
         with open("/proc/self/cgroup", encoding="utf-8") as fh:
             for line in fh:
                 # systemd cgroup line ends with the unit name
                 if ".service" in line:
-                    parts = line.strip().split("/")
+                    cgroup_path = line.strip().split(":", 2)[-1]
+                    parts = cgroup_path.split("/")
                     for p in reversed(parts):
                         if p.endswith(".service"):
                             unit_name = p
@@ -360,11 +362,20 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
     if not unit_name:
         return None
 
-    # Query systemctl for TimeoutStopUSec.  Use --user OR system depending
-    # on which manager actually owns the unit.  Try user first since
-    # that's the common case for hermes.
+    # Query the manager that owns the cgroup.  Asking the wrong manager for
+    # a missing unit can still return exit code 0 plus its default 90-second
+    # TimeoutStopUSec, which creates a false stale-unit warning.  Retain the
+    # historical user-then-system fallback only for unusual cgroup layouts
+    # where the owning manager cannot be inferred.
+    if cgroup_path and cgroup_path.startswith("/system.slice/"):
+        manager_flags = [[]]
+    elif cgroup_path and cgroup_path.startswith("/user.slice/"):
+        manager_flags = [["--user"]]
+    else:
+        manager_flags = [["--user"], []]
+
     timeout_us: Optional[int] = None
-    for flag in (["--user"], []):
+    for flag in manager_flags:
         try:
             result = subprocess.run(
                 ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
