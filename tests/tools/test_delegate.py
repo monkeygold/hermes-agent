@@ -30,10 +30,12 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _classify_delegation_route,
     _extract_output_tail,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_delegation_route,
     _inherit_parent_base_url,
 )
 
@@ -71,6 +73,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertEqual(props["route"]["enum"], ["auto", "kimi", "luna"])
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["route"]["enum"],
+            ["auto", "kimi", "luna"],
+        )
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -87,6 +94,121 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+
+class TestDelegationRoutes(unittest.TestCase):
+    def test_auto_classifier_routes_bounded_evidence_to_kimi(self):
+        self.assertEqual(
+            _classify_delegation_route("Inspect the docs and run a bounded pytest"),
+            "kimi",
+        )
+
+    def test_auto_classifier_routes_code_and_ambiguous_work_to_luna(self):
+        self.assertEqual(
+            _classify_delegation_route("Fix the authentication bug"), "luna"
+        )
+        self.assertEqual(_classify_delegation_route("Handle this task"), "luna")
+
+    def test_route_config_pins_effective_executor(self):
+        cfg = {
+            "route_default": "auto",
+            "max_iterations": 20,
+            "routes": {
+                "kimi": {
+                    "model": "Kimi K3",
+                    "provider": "kimi-coding",
+                    "reasoning_effort": "xhigh",
+                },
+                "luna": {
+                    "model": "gpt-5.6-luna",
+                    "provider": "openai-codex",
+                    "reasoning_effort": "xhigh",
+                },
+            },
+        }
+        name, effective = _resolve_delegation_route(
+            {"goal": "Research the local documentation"}, None, cfg
+        )
+        self.assertEqual(name, "kimi")
+        self.assertEqual(effective["model"], "Kimi K3")
+        self.assertEqual(effective["provider"], "kimi-coding")
+        self.assertEqual(effective["reasoning_effort"], "xhigh")
+        self.assertNotIn("routes", effective)
+
+    def test_explicit_per_task_route_wins(self):
+        cfg = {
+            "routes": {
+                "kimi": {"model": "Kimi K3"},
+                "luna": {"model": "gpt-5.6-luna"},
+            }
+        }
+        name, effective = _resolve_delegation_route(
+            {"goal": "Research docs", "route": "luna"}, "kimi", cfg
+        )
+        self.assertEqual(name, "luna")
+        self.assertEqual(effective["model"], "gpt-5.6-luna")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_routes_resolve_distinct_models_at_xhigh(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 20,
+            "routes": {
+                "kimi": {
+                    "model": "Kimi K3",
+                    "provider": "kimi-coding",
+                    "reasoning_effort": "xhigh",
+                },
+                "luna": {
+                    "model": "gpt-5.6-luna",
+                    "provider": "openai-codex",
+                    "reasoning_effort": "xhigh",
+                },
+            },
+        }
+
+        def resolve(effective_cfg, _parent):
+            return {
+                "model": effective_cfg["model"],
+                "provider": effective_cfg["provider"],
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+                "api_mode": "chat_completions",
+            }
+
+        mock_creds.side_effect = resolve
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, patch(
+            "tools.delegate_tool._run_single_child"
+        ) as mock_run:
+            mock_build.side_effect = [MagicMock(model="Kimi K3"), MagicMock(model="gpt-5.6-luna")]
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+            delegate_task(
+                tasks=[
+                    {"goal": "Inspect docs", "route": "kimi"},
+                    {"goal": "Fix the bug", "route": "luna"},
+                ],
+                parent_agent=parent,
+            )
+
+        self.assertEqual(
+            [call.kwargs["model"] for call in mock_build.call_args_list],
+            ["Kimi K3", "gpt-5.6-luna"],
+        )
+        self.assertEqual(
+            [call.kwargs["route"] for call in mock_build.call_args_list],
+            ["kimi", "luna"],
+        )
+        self.assertEqual(
+            [call.kwargs["reasoning_effort_override"] for call in mock_build.call_args_list],
+            ["xhigh", "xhigh"],
+        )
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -2254,6 +2376,32 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
+    def test_route_reasoning_effort_wins_over_global_config(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {"reasoning_effort": "medium"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "low"}
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="Kimi K3",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            reasoning_effort_override="xhigh",
+            route="kimi",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(
+            call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"}
+        )
+        self.assertEqual(MockAgent.return_value._delegate_route, "kimi")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
     def test_override_reasoning_effort_none_disables(self, MockAgent, mock_cfg):
         """delegation.reasoning_effort: 'none' disables thinking for subagents."""
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "none"}
@@ -2310,6 +2458,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "route": "kimi",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -2325,6 +2474,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["route"], "kimi")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 

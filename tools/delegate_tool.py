@@ -126,6 +126,11 @@ MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected u
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
+# Operator-approved task routes. ``auto`` classifies the bounded task before
+# credentials are resolved; provider/model/effort still come from
+# ``delegation.routes`` so the runtime never invents a provider.
+_DELEGATION_ROUTES = frozenset({"auto", "kimi", "luna"})
+_UNSET = object()
 # No upper ceiling on spawn depth — like max_concurrent_children, depth has a
 # floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
 # stays flat (MAX_DEPTH = 1); raising the config knob is an explicit opt-in.
@@ -349,6 +354,82 @@ def _normalize_role(r: Optional[str]) -> str:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
+
+
+def _normalize_route(route: Optional[str]) -> str:
+    """Normalize a model-facing route to ``auto``, ``kimi``, or ``luna``."""
+    if route is None or not str(route).strip():
+        return "auto"
+    normalized = str(route).strip().lower()
+    if normalized in _DELEGATION_ROUTES:
+        return normalized
+    logger.warning("Unknown delegate_task route=%r, coercing to 'auto'", route)
+    return "auto"
+
+
+def _classify_delegation_route(goal: str, context: Optional[str] = None) -> str:
+    """Choose the conservative configured route for one bounded task.
+
+    Luna owns implementation, debugging, security, and review. Kimi owns
+    bounded discovery, research, documentation, and test execution. Ambiguous
+    work falls back to Luna because it is the safer executor for tasks that may
+    turn into code changes.
+    """
+    text = f"{goal}\n{context or ''}".casefold()
+    luna_markers = (
+        "implement", "implément", "corrig", "fix", "patch", "bug", "debug",
+        "débog", "modifi", "edit", "refactor", "migrat", "security", "sécur",
+        "vuln", "audit", "review", "revue", "architecture", "incident",
+        "permission", "auth", "deploy", "production", "live",
+    )
+    if any(marker in text for marker in luna_markers):
+        return "luna"
+
+    kimi_markers = (
+        "research", "recherch", "scan", "inspect", "cartograph", "document",
+        "documentation", "résum", "summar", "collect", "repér", "find",
+        "locate", "list", "liste", "read-only", "lecture seule", "test",
+        "pytest", "benchmark", "compare", "compar",
+    )
+    if any(marker in text for marker in kimi_markers):
+        return "kimi"
+    return "luna"
+
+
+def _resolve_delegation_route(
+    task: Dict[str, Any],
+    requested_route: Optional[str],
+    cfg: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    """Return ``(route_name, effective_config)`` for one task.
+
+    Installations without ``delegation.routes`` retain the legacy single-route
+    behavior. Once routes are configured, a missing route is an operator
+    configuration error rather than a silent model/provider fallback.
+    """
+    route = _normalize_route(
+        task.get("route") or requested_route or cfg.get("route_default")
+    )
+    if route == "auto":
+        route = _classify_delegation_route(
+            str(task.get("goal") or ""), task.get("context")
+        )
+
+    configured_routes = cfg.get("routes")
+    if not isinstance(configured_routes, dict) or not configured_routes:
+        return route, dict(cfg)
+
+    route_cfg = configured_routes.get(route)
+    if not isinstance(route_cfg, dict):
+        available = ", ".join(sorted(str(name) for name in configured_routes))
+        raise ValueError(
+            f"Delegation route '{route}' is not configured. Available routes: "
+            f"{available or '<none>'}."
+        )
+
+    effective_cfg = {key: value for key, value in cfg.items() if key != "routes"}
+    effective_cfg.update(route_cfg)
+    return route, effective_cfg
 
 
 def _get_max_concurrent_children() -> int:
@@ -1060,6 +1141,9 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Route-specific reasoning wins over the legacy global delegation value.
+    reasoning_effort_override: Any = _UNSET,
+    route: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1258,7 +1342,11 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            delegation_cfg.get("reasoning_effort")
+            if reasoning_effort_override is _UNSET
+            else reasoning_effort_override
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1366,6 +1454,7 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    child._delegate_route = route
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1416,6 +1505,7 @@ def _build_child_agent(
             child_session_id=getattr(child, "session_id", None),
             child_subagent_id=subagent_id,
             child_role=effective_role,
+            child_route=route,
             child_goal=goal,
         )
     except Exception:
@@ -1743,6 +1833,14 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _child_reasoning_effort(child: Any) -> Optional[str]:
+    config = getattr(child, "reasoning_config", None)
+    if not isinstance(config, dict):
+        return None
+    effort = config.get("effort")
+    return effort if isinstance(effort, str) else None
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2056,6 +2154,8 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                "route": getattr(child, "_delegate_route", None),
+                "reasoning_effort": _child_reasoning_effort(child),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -2151,6 +2251,8 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "route": getattr(child, "_delegate_route", None),
+            "reasoning_effort": _child_reasoning_effort(child),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2384,6 +2486,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2391,13 +2494,17 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, role, route)
+      - Batch:  provide tasks array [{goal, context, role, route}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'route' parameter selects an operator-configured executor. ``auto``
+    deterministically chooses Kimi for bounded evidence work and Luna for code,
+    debugging, security, review, or ambiguous tasks. Per-task route wins.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2456,16 +2563,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2483,9 +2580,11 @@ def delegate_task(
                 f"delegate_task calls, or increase "
                 f"delegation.max_concurrent_children in config.yaml."
             )
-        task_list = tasks
+        task_list = [dict(task) if isinstance(task, dict) else task for task in tasks]
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {"goal": goal, "context": context, "role": top_role, "route": route}
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2500,6 +2599,21 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve every route before constructing any child. A bad route or
+    # credential must fail atomically instead of leaving an already-built
+    # earlier child attached to the parent.
+    resolved_routes: Dict[int, tuple[str, Dict[str, Any], Dict[str, Any]]] = {}
+    try:
+        for i, task in enumerate(task_list):
+            effective_route, route_cfg = _resolve_delegation_route(
+                task, route, cfg
+            )
+            creds = _resolve_delegation_credentials(route_cfg, parent_agent)
+            task["route"] = effective_route
+            resolved_routes[i] = (effective_route, route_cfg, creds)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2524,6 +2638,7 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            effective_route, route_cfg, creds = resolved_routes[i]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2543,6 +2658,10 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
+                reasoning_effort_override=route_cfg.get(
+                    "reasoning_effort", _UNSET
+                ),
+                route=effective_route,
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -2616,6 +2735,12 @@ def delegate_task(
                                         "error": str(exc),
                                         "api_calls": 0,
                                         "duration_seconds": 0,
+                                        "route": getattr(
+                                            _child_by_index.get(idx), "_delegate_route", None
+                                        ),
+                                        "reasoning_effort": _child_reasoning_effort(
+                                            _child_by_index.get(idx)
+                                        ),
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
@@ -2628,6 +2753,12 @@ def delegate_task(
                                     "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
                                     "duration_seconds": 0,
+                                    "route": getattr(
+                                        _child_by_index.get(idx), "_delegate_route", None
+                                    ),
+                                    "reasoning_effort": _child_reasoning_effort(
+                                        _child_by_index.get(idx)
+                                    ),
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
@@ -2653,6 +2784,12 @@ def delegate_task(
                                 "error": str(exc),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
+                                "route": getattr(
+                                    _child_by_index.get(idx), "_delegate_route", None
+                                ),
+                                "reasoning_effort": _child_reasoning_effort(
+                                    _child_by_index.get(idx)
+                                ),
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
@@ -2902,6 +3039,18 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        _models = sorted(
+            {
+                str(getattr(child, "model", "") or "")
+                for child in _child_agents
+                if str(getattr(child, "model", "") or "")
+            }
+        )
+        _dispatch_model = (
+            _models[0]
+            if len(_models) == 1
+            else ("mixed:" + ",".join(_models) if _models else None)
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -2909,7 +3058,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
@@ -2938,6 +3087,7 @@ def delegate_task(
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
+                "routes": [t.get("route") for t in task_list],
                 "note": note,
             }
             return json.dumps(payload, ensure_ascii=False)
@@ -3272,7 +3422,7 @@ def _build_top_level_description() -> str:
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context, toolsets).\n"
+        "1. Single task: provide 'goal' (+ optional context, role, route).\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
@@ -3319,7 +3469,9 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Route is selectable as auto, kimi, or luna. auto uses bounded task "
+        "classification; each route resolves only the operator-pinned provider, "
+        "model, and reasoning effort from delegation.routes in config.yaml.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3335,7 +3487,8 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/toolsets are ignored."
+        "When provided, top-level goal/context are ignored; top-level role/route "
+        "act as defaults for items that omit them."
     )
 
 
@@ -3448,6 +3601,15 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "route": {
+                            "type": "string",
+                            "enum": ["auto", "kimi", "luna"],
+                            "description": (
+                                "Per-task executor route. auto chooses Kimi for "
+                                "bounded evidence work and Luna for code, debug, "
+                                "security, review, or ambiguous work."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3460,6 +3622,15 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "route": {
+                "type": "string",
+                "enum": ["auto", "kimi", "luna"],
+                "description": (
+                    "Executor route for a single task or default for a batch. "
+                    "auto chooses Kimi for bounded evidence work and Luna for "
+                    "code, debugging, security, review, or ambiguous work."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -3531,6 +3702,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
