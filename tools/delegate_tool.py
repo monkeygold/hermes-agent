@@ -1144,6 +1144,9 @@ def _build_child_agent(
     # Route-specific reasoning wins over the legacy global delegation value.
     reasoning_effort_override: Any = _UNSET,
     route: Optional[str] = None,
+    # Routes pinned in delegation.routes are isolated from the parent's
+    # fallback providers. Legacy installations without routes keep inheriting.
+    inherit_parent_fallback: bool = True,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1361,11 +1364,14 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # Legacy single-route installations inherit the parent's fallback chain.
+    # A child selected from delegation.routes is operator-pinned and must not
+    # silently switch to any provider from the parent chain.
+    parent_fallback = (
+        (getattr(parent_agent, "_fallback_chain", None) or None)
+        if inherit_parent_fallback
+        else []
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -2549,6 +2555,10 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    configured_routes = cfg.get("routes")
+    inherit_parent_fallback = not (
+        isinstance(configured_routes, dict) and bool(configured_routes)
+    )
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2662,6 +2672,7 @@ def delegate_task(
                     "reasoning_effort", _UNSET
                 ),
                 route=effective_route,
+                inherit_parent_fallback=inherit_parent_fallback,
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)

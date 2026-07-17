@@ -178,6 +178,9 @@ class TestDelegationRoutes(unittest.TestCase):
 
         mock_creds.side_effect = resolve
         parent = _make_mock_parent()
+        parent._fallback_chain = [
+            {"provider": "copilot-acp", "model": "glm-5-2"}
+        ]
         with patch("tools.delegate_tool._build_child_agent") as mock_build, patch(
             "tools.delegate_tool._run_single_child"
         ) as mock_run:
@@ -209,6 +212,43 @@ class TestDelegationRoutes(unittest.TestCase):
             [call.kwargs["reasoning_effort_override"] for call in mock_build.call_args_list],
             ["xhigh", "xhigh"],
         )
+        self.assertEqual(
+            [
+                call.kwargs["inherit_parent_fallback"]
+                for call in mock_build.call_args_list
+            ],
+            [False, False],
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_legacy_config_keeps_parent_fallback_inheritance(
+        self, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {"max_iterations": 20}
+        mock_creds.return_value = {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, patch(
+            "tools.delegate_tool._run_single_child"
+        ) as mock_run:
+            mock_build.return_value = MagicMock(model="anthropic/claude-sonnet-4")
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+            delegate_task(goal="Inspect docs", parent_agent=parent)
+
+        self.assertTrue(mock_build.call_args.kwargs["inherit_parent_fallback"])
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -3263,7 +3303,7 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 
 
 class TestFallbackModelInheritance(unittest.TestCase):
-    """Subagents must inherit the parent's fallback provider chain."""
+    """Fallback inheritance depends on how the child route was selected."""
 
     def test_child_inherits_fallback_chain(self):
         """_build_child_agent passes parent._fallback_chain as fallback_model."""
@@ -3307,6 +3347,50 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+    def _assert_routed_child_cannot_switch_provider(self, route, model):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://example.invalid/v1"
+        parent.api_key = "test-key"
+        parent.provider = "custom"
+        parent.api_mode = "chat_completions"
+        parent.enabled_toolsets = []
+        parent._client_kwargs = {
+            "base_url": parent.base_url,
+            "api_key": parent.api_key,
+        }
+        forbidden_fallback = {"provider": "copilot-acp", "model": "glm-5-2"}
+        parent._fallback_chain = [forbidden_fallback]
+
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            child = _build_child_agent(
+                task_index=0,
+                goal=f"test isolated {route} route",
+                context=None,
+                toolsets=None,
+                model=model,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="custom",
+                override_base_url="https://example.invalid/v1",
+                override_api_key="test-key",
+                override_api_mode="chat_completions",
+                route=route,
+                inherit_parent_fallback=False,
+            )
+
+            self.assertEqual(child._fallback_chain, [])
+            self.assertIsNone(child._fallback_model)
+            self.assertNotIn(forbidden_fallback, child._fallback_chain)
+            self.assertFalse(child._try_activate_fallback())
+            self.assertEqual(child.provider, "custom")
+
+    def test_kimi_receives_empty_chain_without_third_party_switch(self):
+        self._assert_routed_child_cannot_switch_provider("kimi", "Kimi K3")
+
+    def test_luna_receives_empty_chain_without_third_party_switch(self):
+        self._assert_routed_child_cannot_switch_provider("luna", "gpt-5.6-luna")
 
 
 if __name__ == "__main__":
