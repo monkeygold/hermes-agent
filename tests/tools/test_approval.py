@@ -14,9 +14,11 @@ import pytest
 import tools.approval as approval_module
 from hermes_constants import get_hermes_home
 from tools.approval import (
+    AllowlistPersistenceError,
     _get_approval_mode,
     _normalize_approval_mode,
     _smart_approve,
+    approve_always,
     approve_session,
     detect_dangerous_command,
     detect_hardline_command,
@@ -136,7 +138,9 @@ class TestDetectDangerousRm:
         basename = "hermes-verify-example.py"
 
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):
-            assert detect_dangerous_command(f"rm -f {linked_temp / basename}")[0] is True
+            alias_command = f"rm -f {linked_temp / basename}"
+            assert approval_module._is_verification_artifact_cleanup(alias_command) is False
+            assert detect_dangerous_command(alias_command)[0] is True
             assert detect_dangerous_command(f"rm -f {real_temp / basename}") == (
                 False,
                 None,
@@ -1805,9 +1809,11 @@ class TestFailClosedUnderPromptToolkit:
     stdin capture, not to input().
     """
 
-    def test_denies_when_prompt_toolkit_active_and_no_callback(self):
+    def test_denies_when_prompt_toolkit_active_and_no_callback(self, caplog):
         import threading
         import prompt_toolkit.application.current as ptc
+
+        credential = "sk-" + ("a" * 40)
 
         orig = ptc.get_app_or_none
         ptc.get_app_or_none = lambda: object()  # pretend a pt app is running
@@ -1816,8 +1822,8 @@ class TestFailClosedUnderPromptToolkit:
             def run():
                 result.append(
                     prompt_dangerous_approval(
-                        "rm -rf /",
-                        "test danger",
+                        f"curl https://user:{credential}@example.invalid/path",
+                        f"approval token={credential}",
                         timeout_seconds=30,
                         approval_callback=None,
                     )
@@ -1831,6 +1837,7 @@ class TestFailClosedUnderPromptToolkit:
                 "with no callback -- fail-closed guard is broken"
             )
             assert result == ["deny"]
+            assert credential not in caplog.text
         finally:
             ptc.get_app_or_none = orig
 
@@ -2561,3 +2568,68 @@ class TestApprovalPromptRedaction:
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+
+class TestR11PermanentAllowlist:
+    def test_load_replaces_hot_process_state_and_revokes_disk_deletion(
+        self, monkeypatch, tmp_path,
+    ):
+        """The config file is authoritative, including removal in a hot process."""
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            "command_allowlist:\n  - disk-pattern\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with mock_patch.object(approval_module, "_permanent_approved", {"stale-pattern"}):
+            approval_module.load_permanent_allowlist()
+            assert approval_module._permanent_approved == {"disk-pattern"}
+            assert is_approved("r11-hot", "disk-pattern") is True
+
+            config_path.write_text("command_allowlist: []\n", encoding="utf-8")
+            approval_module.load_permanent_allowlist()
+            assert approval_module._permanent_approved == set()
+            assert is_approved("r11-hot", "disk-pattern") is False
+
+    def test_always_persists_before_publishing_state(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            "command_allowlist:\n  - disk-existing\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with mock_patch.object(approval_module, "_permanent_approved", {"stale-pattern"}):
+            with mock_patch.object(approval_module, "_session_approved", {}):
+                approve_always("new-pattern", "r11-session")
+                assert approval_module._permanent_approved == {
+                    "disk-existing",
+                    "new-pattern",
+                }
+                assert approval_module._session_approved["r11-session"] == {"new-pattern"}
+
+        import yaml
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved == {"command_allowlist": ["disk-existing", "new-pattern"]}
+
+    def test_always_persistence_failure_publishes_neither_state(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        config_path = home / "config.yaml"
+        config_path.write_text("command_allowlist: []\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(
+            "hermes_cli.config_store.atomic_replace",
+            lambda *_args: (_ for _ in ()).throw(OSError("r11-save-secret")),
+        )
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            with mock_patch.object(approval_module, "_session_approved", {}):
+                with pytest.raises(AllowlistPersistenceError):
+                    approve_always("failed-pattern", "failed-session")
+                assert "failed-pattern" not in approval_module._permanent_approved
+                assert "failed-session" not in approval_module._session_approved
+        assert config_path.read_text(encoding="utf-8") == "command_allowlist: []\n"

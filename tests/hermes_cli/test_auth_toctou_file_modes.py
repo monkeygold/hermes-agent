@@ -22,6 +22,7 @@ import json
 import os
 import stat
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -182,7 +183,9 @@ def test_save_auth_store_uses_os_open_with_0o600_mode(tmp_path, monkeypatch):
         )
 
     auth_tmp_opens = [
-        (p, fl, m) for (p, fl, m) in observed_opens if "auth.json.tmp" in p
+        (p, fl, m)
+        for (p, fl, m) in observed_opens
+        if Path(p).name.startswith(".auth.json.") and Path(p).name.endswith(".tmp")
     ]
     assert auth_tmp_opens, (
         f"os.open was never called for the auth.json temp file; "

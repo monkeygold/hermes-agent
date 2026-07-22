@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import io
 import json
 import logging
 import os
@@ -687,6 +688,14 @@ def format_managed_message(action: str = "modify this Hermes installation") -> s
 def managed_error(action: str = "modify configuration"):
     """Print user-friendly error for managed mode."""
     print(format_managed_message(action), file=sys.stderr)
+
+
+class ManagedConfigWriteError(RuntimeError):
+    """A public config mutator was refused by package-managed mode."""
+
+
+def _refuse_managed_write(action: str) -> None:
+    raise ManagedConfigWriteError(format_managed_message(action))
 
 
 # =============================================================================
@@ -6908,6 +6917,9 @@ def read_raw_config() -> Dict[str, Any]:
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
+    from hermes_cli.config_store import recover_incomplete_transactions
+
+    recover_incomplete_transactions(get_hermes_home())
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -6939,7 +6951,7 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
     if config_path is None:
         config_path = get_config_path()
     try:
-        config_path.stat()
+        metadata = config_path.stat()
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -6947,6 +6959,14 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
             f"Refusing to overwrite {config_path}: existing config.yaml cannot be accessed "
             f"({exc}). Fix the file permissions or move it aside first."
         ) from exc
+
+    if not stat.S_IMODE(metadata.st_mode) & (
+        stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+    ):
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml has no read permission bits. "
+            "Fix the file permissions or move it aside first."
+        )
 
     try:
         with open(config_path, "rb") as f:
@@ -6956,6 +6976,59 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
             f"Refusing to overwrite {config_path}: existing config.yaml cannot be read "
             f"({exc}). Fix the file permissions or move it aside first."
         ) from exc
+
+
+def serialize_yaml_bytes(data: Any, **kwargs: Any) -> bytes:
+    """Serialize YAML exactly as Hermes' atomic config writers do."""
+    from utils import IndentDumper
+
+    default_flow_style = kwargs.pop("default_flow_style", False)
+    sort_keys = kwargs.pop("sort_keys", False)
+    extra_content = kwargs.pop("extra_content", None)
+    if kwargs:
+        raise TypeError(f"Unsupported YAML write options: {', '.join(sorted(kwargs))}")
+    stream = io.StringIO()
+    yaml.dump(
+        data,
+        stream,
+        Dumper=IndentDumper,
+        default_flow_style=default_flow_style,
+        sort_keys=sort_keys,
+        allow_unicode=True,
+    )
+    if extra_content:
+        stream.write(extra_content)
+    return stream.getvalue().encode("utf-8")
+
+
+def _config_cache_physical_identity(path: Path) -> tuple[Any, ...]:
+    """Return an alias-stable identity, including for dangling symlinks."""
+    try:
+        metadata = path.stat()
+    except OSError:
+        return ("realpath", os.path.normcase(os.path.realpath(os.fspath(path))))
+    return ("inode", metadata.st_dev, metadata.st_ino)
+
+
+def invalidate_config_caches(config_path: Path) -> None:
+    """Drop every cache key aliasing the config after successful publication."""
+    with _CONFIG_LOCK:
+        target_identity = _config_cache_physical_identity(config_path)
+        cached_keys = (
+            set(_RAW_CONFIG_CACHE)
+            | set(_LOAD_CONFIG_CACHE)
+            | set(_LAST_EXPANDED_CONFIG_BY_PATH)
+            | {str(config_path)}
+        )
+        aliases = {
+            key
+            for key in cached_keys
+            if _config_cache_physical_identity(Path(key)) == target_identity
+        }
+        for path_key in aliases:
+            _RAW_CONFIG_CACHE.pop(path_key, None)
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LAST_EXPANDED_CONFIG_BY_PATH.pop(path_key, None)
 
 
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
@@ -6978,10 +7051,16 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     ``kwargs`` are forwarded verbatim to ``atomic_yaml_write``
     (``sort_keys``, ``default_flow_style``, ``extra_content``, ...).
     """
-    from utils import atomic_yaml_write
-
+    if is_managed():
+        _refuse_managed_write("write configuration")
     require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    from hermes_cli.config_store import publish_transaction
+
+    publish_transaction(
+        {config_path: serialize_yaml_bytes(data, **kwargs)},
+        home=get_hermes_home(),
+    )
+    invalidate_config_caches(config_path)
 
 
 def load_config() -> Dict[str, Any]:
@@ -7142,8 +7221,11 @@ def apply_terminal_config_to_env(
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+    ensure_hermes_home()
+    from hermes_cli.config_store import recover_incomplete_transactions
+
+    recover_incomplete_transactions(get_hermes_home())
     with _CONFIG_LOCK:
-        ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
@@ -7386,8 +7468,7 @@ def save_config(
     """
     with _CONFIG_LOCK:
         if is_managed():
-            managed_error("save configuration")
-            return
+            _refuse_managed_write("save configuration")
         # Managed scope: strip any leaf the managed layer pins, so a bulk write
         # (wizard / programmatic save) never persists a user value that would
         # silently lose to managed on the next load. Single-key `config set`
@@ -7404,8 +7485,6 @@ def save_config(
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
                     file=sys.stderr,
                 )
-        from utils import atomic_yaml_write
-
         ensure_hermes_home()
         config_path = get_config_path()
         require_readable_config_before_write(config_path)
@@ -7469,7 +7548,7 @@ def save_config(
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
+        atomic_config_write(
             config_path,
             normalized,
             extra_content="".join(parts) if parts else None,
@@ -7777,6 +7856,7 @@ def _quote_env_value(value: str) -> str:
         "#" in value
         or '"' in value
         or "'" in value
+        or "\t" in value
         or value != value.strip()
     )
     if not needs_quoting:
@@ -7785,11 +7865,63 @@ def _quote_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _prepare_env_assignment(key: str, value: str) -> tuple[str, str]:
+    if not _ENV_VAR_NAME_RE.match(key):
+        raise ValueError(f"Invalid environment variable name: {key!r}")
+    _reject_denylisted_env_var(key)
+    clean_value = value.replace("\n", "").replace("\r", "")
+    clean_value = _check_non_ascii_credential(key, clean_value)
+    return clean_value, _quote_env_value(clean_value)
+
+
+def _match_env_assignment(line: str, key: str) -> re.Match[str] | None:
+    """Match a dotenv assignment, including optional shell ``export`` syntax."""
+    return re.match(
+        rf"^(?P<indent>[ \t]*)(?P<export>export[ \t]+)?{re.escape(key)}=",
+        line,
+    )
+
+
+def _set_env_bytes(raw: bytes | None, key: str, value: str) -> tuple[bytes, str]:
+    clean_value, serialized_value = _prepare_env_assignment(key, value)
+    lines = (
+        raw.decode("utf-8-sig", errors="replace").splitlines(keepends=True)
+        if raw is not None
+        else []
+    )
+    lines = _sanitize_env_lines(lines)
+    for index, line in enumerate(lines):
+        match = _match_env_assignment(line, key)
+        if match is not None:
+            prefix = f"{match.group('indent')}{match.group('export') or ''}"
+            lines[index] = f"{prefix}{key}={serialized_value}\n"
+            break
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f"{key}={serialized_value}\n")
+    return "".join(lines).encode("utf-8"), clean_value
+
+
+def _remove_env_bytes(raw: bytes | None, key: str) -> tuple[bytes | None, bool]:
+    if raw is None:
+        return None, False
+    lines = raw.decode("utf-8-sig", errors="replace").splitlines(keepends=True)
+    lines = _sanitize_env_lines(lines)
+    kept: list[str] = []
+    removed = False
+    for line in lines:
+        if _match_env_assignment(line, key) is not None:
+            removed = True
+            continue
+        kept.append(line)
+    return "".join(kept).encode("utf-8"), removed
+
+
 def save_env_value(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
     if is_managed():
-        managed_error(f"set {key}")
-        return
+        _refuse_managed_write(f"set {key}")
     # Managed scope guard: a managed env key can't be set by the user — the
     # managed .env wins at load anyway. Distinct from is_managed() above.
     from hermes_cli import managed_scope
@@ -7803,86 +7935,25 @@ def save_env_value(key: str, value: str):
             file=sys.stderr,
         )
         return
-    if not _ENV_VAR_NAME_RE.match(key):
-        raise ValueError(f"Invalid environment variable name: {key!r}")
-    _reject_denylisted_env_var(key)
-    value = value.replace("\n", "").replace("\r", "")
-    # API keys / tokens must be ASCII — strip non-ASCII with a warning.
-    value = _check_non_ascii_credential(key, value)
+    value, _serialized_value = _prepare_env_assignment(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
 
-    # On Windows, open() defaults to the system locale (cp1252) which can
-    # cause OSError errno 22 on UTF-8 .env files.
-    read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
-    write_kw = {"encoding": "utf-8"}
+    from hermes_cli.config_store import update_transaction
 
-    lines = []
-    if env_path.exists():
-        with open(env_path, **read_kw) as f:
-            lines = f.readlines()
-        # Sanitize on every read: split concatenated keys, drop stale placeholders
-        lines = _sanitize_env_lines(lines)
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        updated, _clean = _set_env_bytes(current[env_path], key, value)
+        return {env_path: updated}
 
-    serialized_value = _quote_env_value(value)
-
-    # Find and update or append
-    found = False
-    for i, line in enumerate(lines):
-        if line.strip().startswith(f"{key}="):
-            lines[i] = f"{key}={serialized_value}\n"
-            found = True
-            break
-
-    if not found:
-        # Ensure there's a newline at the end of the file before appending
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(f"{key}={serialized_value}\n")
-    
-    fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
-    # Preserve original permissions so Docker volume mounts aren't clobbered.
-    original_mode = None
-    if env_path.exists():
-        try:
-            original_mode = stat.S_IMODE(env_path.stat().st_mode)
-        except OSError:
-            pass
-    try:
-        with os.fdopen(fd, 'w', **write_kw) as f:
-            f.writelines(lines)
-            f.flush()
-            os.fsync(f.fileno())
-        atomic_replace(tmp_path, env_path)
-        # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
-        # instead of letting _secure_file unconditionally tighten to 0600.
-        if original_mode is not None:
-            try:
-                os.chmod(env_path, original_mode)
-            except OSError:
-                pass
-        else:
-            _secure_file(env_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
+    update_transaction([env_path], _update, home=get_hermes_home())
     os.environ[key] = value
     invalidate_env_cache()
 
 
 def remove_env_value(key: str) -> bool:
-    """Remove a key from ~/.hermes/.env and os.environ.
-
-    Returns True if the key was found and removed, False otherwise.
-    """
+    """Remove a key from ~/.hermes/.env and os.environ."""
     if is_managed():
-        managed_error(f"remove {key}")
-        return False
-    # Managed scope guard: a managed env key can't be removed by the user.
+        _refuse_managed_write(f"remove {key}")
     from hermes_cli import managed_scope
 
     if managed_scope.is_env_managed(key):
@@ -7896,52 +7967,20 @@ def remove_env_value(key: str) -> bool:
         return False
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
+    ensure_hermes_home()
     env_path = get_env_path()
-    if not env_path.exists():
-        os.environ.pop(key, None)
-        return False
+    found = False
 
-    read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
-    write_kw = {"encoding": "utf-8"}
+    from hermes_cli.config_store import update_transaction
 
-    with open(env_path, **read_kw) as f:
-        lines = f.readlines()
-    lines = _sanitize_env_lines(lines)
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        nonlocal found
+        updated, found = _remove_env_bytes(current[env_path], key)
+        if not found or updated is None:
+            return {}
+        return {env_path: updated}
 
-    new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
-    found = len(new_lines) < len(lines)
-
-    if found:
-        fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
-        # Preserve original permissions so Docker volume mounts aren't clobbered.
-        original_mode = None
-        try:
-            original_mode = stat.S_IMODE(env_path.stat().st_mode)
-        except OSError:
-            pass
-        try:
-            with os.fdopen(fd, 'w', **write_kw) as f:
-                f.writelines(new_lines)
-                f.flush()
-                os.fsync(f.fileno())
-            atomic_replace(tmp_path, env_path)
-            # Preserve the original file mode (e.g. 0640 for Docker volume
-            # mounts) instead of letting _secure_file unconditionally tighten
-            # to 0600. Mirrors save_env_value().
-            if original_mode is not None:
-                try:
-                    os.chmod(env_path, original_mode)
-                except OSError:
-                    pass
-            else:
-                _secure_file(env_path)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-
+    update_transaction([env_path], _update, home=get_hermes_home())
     os.environ.pop(key, None)
     invalidate_env_cache()
     return found
@@ -8369,8 +8408,7 @@ def _default_value_for_key(dotted_key: str):
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
     if is_managed():
-        managed_error("set configuration values")
-        return
+        _refuse_managed_write("set configuration values")
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the
     # source. Distinct from is_managed() above (the package-manager write-lock).
@@ -8393,27 +8431,9 @@ def set_config_value(key: str, value: str):
         print(f"✓ Set {key} in {get_env_path()}")
         return
     
-    # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
+    # Otherwise it goes to config.yaml.  Coerce before opening any path.
     config_path = get_config_path()
     require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
-    # Handle nested keys (e.g., "tts.provider") including numeric list
-    # indices (e.g., "custom_providers.0.api_key").  Delegates to
-    # _set_nested which preserves list-typed nodes; before #17876 the
-    # inline navigation here silently overwrote lists with dicts.
-
-    # Preserve values for string-typed settings.  In particular, enum members
-    # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
-    # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
     if not isinstance(_default_value_for_key(key), str):
         if value.lower() in {'true', 'yes', 'on'}:
@@ -8426,26 +8446,42 @@ def set_config_value(key: str, value: str):
             coerced_value = float(value)
 
     value = coerced_value
-    _set_nested(user_config, key, value)
-    # Normalize the api_base → base_url alias at set-time too (issue #8919),
-    # so a fresh `hermes config set model.api_base ...` lands on the canonical
-    # key the runtime resolver actually reads, instead of being silently
-    # ignored. Mirrors the load-time migration in _normalize_root_model_keys.
     _alias_norm = key.strip().lower()
     if _alias_norm in ("model.api_base", "api_base"):
-        user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
-        print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
-    
-    # Keep .env in sync for keys that terminal_tool reads directly from env vars.
-    # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
+    env_value = _terminal_env_value(value) if env_var and key != "terminal.cwd" else None
+    if env_var and env_value is not None:
+        env_value, _serialized = _prepare_env_assignment(env_var, env_value)
+
+    ensure_hermes_home()
+    targets = [config_path]
+    env_path = get_env_path()
+    if env_var and env_value is not None:
+        targets.append(env_path)
+    from hermes_cli.config_store import update_transaction
+
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        raw = current[config_path]
+        user_config = yaml.safe_load(raw.decode("utf-8")) if raw is not None else {}
+        if user_config is None:
+            user_config = {}
+        if not isinstance(user_config, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        _set_nested(user_config, key, value)
+        updates = {config_path: serialize_yaml_bytes(user_config, sort_keys=False)}
+        if env_var and env_value is not None:
+            env_bytes, _clean = _set_env_bytes(current[env_path], env_var, env_value)
+            updates[env_path] = env_bytes
+        return updates
+
+    update_transaction(targets, _update, home=get_hermes_home())
+    invalidate_config_caches(config_path)
+    if env_var and env_value is not None:
+        os.environ[env_var] = env_value
+        invalidate_env_cache()
+    if _alias_norm in ("model.api_base", "api_base"):
+        print("  (note: 'api_base' is an alias — saved as model.base_url)")
 
     # Mask the echoed value when the (possibly nested) key is credential-shaped
     # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
@@ -8478,8 +8514,7 @@ def get_config_value(key: str, *, as_json: bool = False):
 def unset_config_value(key: str):
     """Remove a user-set configuration or .env value."""
     if is_managed():
-        managed_error("unset configuration values")
-        return
+        _refuse_managed_write("unset configuration values")
     # Managed scope guard: a key pinned by the managed layer cannot be unset by
     # the user — the next load would reinstate it anyway (mirrors set_config_value).
     from hermes_cli import managed_scope
@@ -8503,29 +8538,46 @@ def unset_config_value(key: str):
         return
 
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
-
-    removed = _unset_nested(user_config, key)
-
-    # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     env_var = terminal_config_env_var_for_key(key)
+    env_path = get_env_path()
+    ensure_hermes_home()
+    targets = [config_path]
     if env_var and key != "terminal.cwd":
-        removed = remove_env_value(env_var) or removed
+        targets.append(env_path)
+    removed_config = False
+    removed_env = False
+    from hermes_cli.config_store import update_transaction
+
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        nonlocal removed_config, removed_env
+        raw = current[config_path]
+        user_config = yaml.safe_load(raw.decode("utf-8")) if raw is not None else {}
+        if user_config is None:
+            user_config = {}
+        if not isinstance(user_config, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        removed_config = _unset_nested(user_config, key)
+        updates: Dict[Path, bytes] = {}
+        if removed_config:
+            updates[config_path] = serialize_yaml_bytes(user_config, sort_keys=False)
+        if env_var and key != "terminal.cwd":
+            env_bytes, removed_env = _remove_env_bytes(current[env_path], env_var)
+            if removed_env and env_bytes is not None:
+                updates[env_path] = env_bytes
+        return updates
+
+    update_transaction(targets, _update, home=get_hermes_home())
+    removed = removed_config or removed_env
 
     if not removed:
         print(f"Config key not set: {key}", file=sys.stderr)
         sys.exit(1)
 
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    if removed_config:
+        invalidate_config_caches(config_path)
+    if removed_env and env_var:
+        os.environ.pop(env_var, None)
+        invalidate_env_cache()
     print(f"✓ Unset {key} from {config_path}")
 
 

@@ -54,7 +54,7 @@ Security model:
   whatever was installed at setup time.
 * **Offline detection.** If the install fails (offline, mirror down,
   PyPI 404 / quarantine), we surface the failure as
-  :class:`FeatureUnavailable` with the actual pip stderr — no silent
+  :class:`FeatureUnavailable` with redacted pip stderr — no silent
   retries, no caching of bad state.
 
 Adding a new backend:
@@ -72,6 +72,7 @@ import os
 import re
 import shutil
 import site
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -80,6 +81,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_AUTHENTICATED_HTTP_URL_RE = re.compile(
+    r"(?P<scheme>https?://)[^\s/@]+(?::[^\s/@]*)?@",
+    re.IGNORECASE,
+)
 
 
 # =============================================================================
@@ -343,6 +349,16 @@ def _ensure_target_ready(target: Path) -> Optional[str]:
     want = _python_abi_tag()
     stamp = target / _TARGET_STAMP_NAME
     try:
+        permission_anchor = target
+        while not permission_anchor.exists() and permission_anchor.parent != permission_anchor:
+            permission_anchor = permission_anchor.parent
+        if permission_anchor.exists() and not stat.S_IMODE(
+            permission_anchor.stat().st_mode
+        ) & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+            return (
+                f"lazy install target {target} is not writable: "
+                f"{permission_anchor} has no write permission bits"
+            )
         if target.exists():
             have = ""
             try:
@@ -417,6 +433,59 @@ def activate_durable_lazy_target() -> None:
         logger.debug("Failed to activate durable lazy target %s: %s", target, e)
 
 
+def _redact_install_output(value: str) -> str:
+    """Redact credentials before install output reaches logs or exceptions."""
+    if not value:
+        return ""
+    from agent.redact import redact_sensitive_text
+
+    value = _AUTHENTICATED_HTTP_URL_RE.sub(
+        lambda match: f"{match.group('scheme')}***@",
+        value,
+    )
+    return redact_sensitive_text(value, force=True)
+
+
+def _config_sources_allow_lazy_installs() -> bool:
+    """Read user and managed lazy-install policy without permissive fallback."""
+    try:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import get_config_path
+        from utils import fast_safe_load
+
+        paths = [get_config_path()]
+        managed_dir = managed_scope.get_managed_dir()
+        if managed_dir is not None:
+            paths.append(managed_dir / "config.yaml")
+    except Exception:
+        return False
+
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8") as stream:
+                raw = fast_safe_load(stream)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return False
+
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            return False
+        security = raw.get("security")
+        if security is None:
+            continue
+        if not isinstance(security, dict):
+            return False
+        if "allow_lazy_installs" not in security:
+            continue
+        value = security["allow_lazy_installs"]
+        if not isinstance(value, bool) or not value:
+            return False
+    return True
+
+
 def _allow_lazy_installs() -> bool:
     """Return whether lazy installs are permitted in this environment.
 
@@ -431,20 +500,15 @@ def _allow_lazy_installs() -> bool:
        redirected there (a path that structurally cannot break the sealed
        venv) and are therefore allowed.
 
-    Defaults to True. If config is unreadable we fail open (allow), because
-    refusing to install would lock people out of their own backends; the
-    decision to block is an explicit user opt-in.
+    Configuration read failures fail closed: dynamic package installation is
+    a code-execution boundary, and an unreadable kill-switch state cannot be
+    treated as authorization.
     """
-    # (1) Config kill switch wins in every mode.
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-    except Exception:
-        cfg = None
-    if cfg is not None:
-        sec = cfg.get("security") or {}
-        if not bool(sec.get("allow_lazy_installs", True)):
-            return False
+    # (1) Config kill switch wins in every mode. Read the physical sources
+    # strictly instead of using load_config(), whose fresh-process parse-error
+    # fallback intentionally returns defaults for general availability.
+    if not _config_sources_allow_lazy_installs():
+        return False
 
     # (2) Sealed-venv env var: blocks ONLY when there is no safe durable
     # target to redirect into. With a target set, the install goes to the
@@ -673,7 +737,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                     if target is not None:
                         _activate_target_on_syspath(target)
                     return _InstallResult(True, r.stdout or "", r.stderr or "")
-                logger.debug("uv pip install failed: %s", r.stderr)
+                logger.debug("uv pip install failed: %s", _redact_install_output(r.stderr or ""))
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 logger.debug("uv invocation failed: %s", e)
 
@@ -813,8 +877,9 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
         # issues (404 quarantine, network down, etc.).
         snippet = (result.stderr or result.stdout or "").strip()
         if snippet:
-            # Clip to a readable size — pip can dump pages of resolution traces.
+            snippet = _redact_install_output(snippet)
             snippet = snippet[-2000:]
+
         raise FeatureUnavailable(
             feature, missing,
             f"pip install failed: {snippet or 'no error output'}"

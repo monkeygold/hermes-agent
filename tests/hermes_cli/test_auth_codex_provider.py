@@ -5,6 +5,7 @@ import time
 import base64
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -974,7 +975,7 @@ def test_is_rate_limited_auth_error_distinguishes_credential_errors():
 
 
 def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypatch):
-    called = {"device_login": 0}
+    called: dict[str, Any] = {"device_login": 0}
 
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_codex_runtime_credentials",
@@ -993,10 +994,11 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
         },
     )
 
-    def _fake_save(tokens, last_refresh=None):
+    def _fake_save(tokens, last_refresh=None, *, set_active=True):
         called["device_login"] += 1
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh
+        called["set_active"] = set_active
 
     monkeypatch.setattr("hermes_cli.auth._save_codex_tokens", _fake_save)
     monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *args, **kwargs: "/tmp/config.yaml")
@@ -1009,6 +1011,7 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+    assert called["set_active"] is False
 
 
 class _FakeResp:

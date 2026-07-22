@@ -15,6 +15,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -69,6 +70,34 @@ def test_atomic_replace_regular_file(tmp_path: Path) -> None:
     assert Path(returned) == target
     assert target.read_text(encoding="utf-8") == "fresh\n"
     assert not target.is_symlink()
+
+
+def test_atomic_replace_rejects_regular_target_retargeted_to_symlink(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import utils
+    from hermes_cli.config_store import UnsafeConfigPathError
+
+    target = tmp_path / "plain.yaml"
+    other = tmp_path / "other.yaml"
+    target.write_text("old\n", encoding="utf-8")
+    other.write_text("other\n", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "fresh\n")
+
+    def retarget_during_capture(_path):
+        target.unlink()
+        target.symlink_to(other)
+        return None
+
+    monkeypatch.setattr(utils, "_preserve_file_owner", retarget_during_capture)
+
+    with pytest.raises(UnsafeConfigPathError, match="target changed"):
+        atomic_replace(tmp, target)
+
+    assert target.is_symlink()
+    assert other.read_text(encoding="utf-8") == "other\n"
+    assert tmp.read_text(encoding="utf-8") == "fresh\n"
 
 
 def test_atomic_replace_first_time_create(tmp_path: Path) -> None:
@@ -239,25 +268,50 @@ def test_atomic_replace_broken_symlink_creates_target(tmp_path: Path) -> None:
     assert missing.read_text(encoding="utf-8") == "created-through-link\n"
 
 
-# ─── EXDEV / EBUSY copy fallback ───────────────────────────────────────────
+# ─── EXDEV safe fallback / EBUSY fail-closed ──────────────────────────────
 
 
-@pytest.mark.parametrize("fail_errno", [errno.EXDEV, errno.EBUSY])
-def test_atomic_replace_copy_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_errno: int
+def test_atomic_replace_exdev_uses_adjacent_atomic_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "config.yaml"
+    target.write_text("old\n", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new\n")
+    real_replace = os.replace
+    calls = 0
+
+    def fail_first_replace(src: str, dst: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+        real_replace(src, dst)
+
+    monkeypatch.setattr("utils.os.replace", fail_first_replace)
+
+    assert Path(atomic_replace(tmp, target)) == target
+    assert calls == 2
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert not tmp.exists()
+
+
+def test_atomic_replace_ebusy_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "config.yaml"
     target.write_text("old\n", encoding="utf-8")
     tmp = _write_tmp(tmp_path, "new\n")
 
     def fail_replace(src: str, dst: str) -> None:
-        raise OSError(fail_errno, os.strerror(fail_errno), src, None, dst)
+        raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), src, None, dst)
 
     monkeypatch.setattr("utils.os.replace", fail_replace)
 
-    assert Path(atomic_replace(tmp, target)) == target
-    assert target.read_text(encoding="utf-8") == "new\n"
-    assert not tmp.exists()
+    with pytest.raises(OSError) as excinfo:
+        atomic_replace(tmp, target)
+    assert excinfo.value.errno == errno.EBUSY
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert tmp.read_text(encoding="utf-8") == "new\n"
 
 
 def test_atomic_replace_copy_fallback_preserves_symlink(
@@ -268,19 +322,26 @@ def test_atomic_replace_copy_fallback_preserves_symlink(
     real.write_text("old\n", encoding="utf-8")
     link.symlink_to(real)
     tmp = _write_tmp(tmp_path, "new\n")
+    real_replace = os.replace
+    calls = 0
 
-    def fail_replace(src: str, dst: str) -> None:
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+    def fail_first_replace(src: str, dst: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+        real_replace(src, dst)
 
-    monkeypatch.setattr("utils.os.replace", fail_replace)
+    monkeypatch.setattr("utils.os.replace", fail_first_replace)
 
     assert Path(atomic_replace(tmp, link)) == real
+    assert calls == 2
     assert link.is_symlink()
     assert real.read_text(encoding="utf-8") == "new\n"
     assert not tmp.exists()
 
 
-def test_atomic_replace_copy_fallback_preserves_metadata(
+def test_atomic_replace_exdev_fallback_preserves_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if os.name != "posix":
@@ -291,15 +352,22 @@ def test_atomic_replace_copy_fallback_preserves_metadata(
     os.chmod(target, 0o600)
     tmp = _write_tmp(tmp_path, "new\n")
     os.chmod(tmp, 0o644)
+    real_replace = os.replace
+    calls = 0
 
-    def fail_replace(src: str, dst: str) -> None:
-        raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), src, None, dst)
+    def fail_first_replace(src: str, dst: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+        real_replace(src, dst)
 
-    monkeypatch.setattr("utils.os.replace", fail_replace)
+    monkeypatch.setattr("utils.os.replace", fail_first_replace)
 
     atomic_replace(tmp, target)
+    assert calls == 2
     assert target.read_text(encoding="utf-8") == "new\n"
-    assert target.stat().st_mode & 0o777 == 0o644
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_atomic_replace_other_oserror_propagates(
@@ -319,6 +387,33 @@ def test_atomic_replace_other_oserror_propagates(
     assert excinfo.value.errno == errno.EACCES
     assert target.read_text(encoding="utf-8") == "old\n"
     assert tmp.exists()
+
+
+def test_atomic_replace_rolls_back_regular_target_when_directory_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "config.yaml"
+    target.write_text("old\n", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new\n")
+
+    from utils import _fsync_directory as real_fsync_directory
+
+    calls = 0
+
+    def fail_first_directory_fsync(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "injected directory fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr("utils._fsync_directory", fail_first_directory_fsync)
+
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        atomic_replace(tmp, target)
+
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert tmp.read_text(encoding="utf-8") == "new\n"
 
 
 def test_atomic_replace_real_cross_device(tmp_path: Path) -> None:
@@ -347,3 +442,26 @@ def test_atomic_replace_real_cross_device(tmp_path: Path) -> None:
         assert not tmp.exists()
     finally:
         _shutil.rmtree(other_fs_dir, ignore_errors=True)
+
+
+def test_atomic_replace_applies_required_mode_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old\n", encoding="utf-8")
+    os.chmod(target, 0o644)
+    tmp = _write_tmp(tmp_path, "new\n")
+    os.chmod(tmp, 0o644)
+    real_replace = os.replace
+    observed_modes: list[int] = []
+
+    def inspect_replace(src: str, dst: str) -> None:
+        observed_modes.append(stat.S_IMODE(os.stat(src).st_mode))
+        real_replace(src, dst)
+
+    monkeypatch.setattr("utils.os.replace", inspect_replace)
+
+    atomic_replace(tmp, target, mode=0o600)
+
+    assert observed_modes == [0o600]
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600

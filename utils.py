@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+_ATOMIC_JSON_WRITE_LOCK = threading.RLock()
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:
@@ -88,55 +90,195 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
-def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
-    """Atomically move *tmp_path* onto *target*, preserving symlinks.
+def _fsync_directory(path: Path) -> None:
+    """Durably persist a directory entry update on POSIX filesystems."""
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
-    ``os.replace(tmp, target)`` atomically swaps ``tmp`` into place at
-    ``target``.  When ``target`` is a symlink, the symlink itself is
-    replaced with a regular file — silently detaching managed deployments
-    that symlink ``config.yaml`` / ``SOUL.md`` / ``auth.json`` etc. from
-    ``~/.hermes/`` to a git-tracked profile package or dotfiles repo
-    (GitHub #16743).
 
-    This helper resolves the symlink first so ``os.replace`` writes to
-    the real file in-place while the symlink survives.  For non-symlink
-    and non-existent paths the behavior is identical to a plain
-    ``os.replace`` call unless the rename fails with ``EXDEV`` or ``EBUSY``;
-    those cases fall back to copy/fsync/unlink for cross-device, bind-mount,
-    and busy-file deployments.
+def atomic_replace(
+    tmp_path: Union[str, Path],
+    target: Union[str, Path],
+    *,
+    mode: int | None = None,
+    follow_symlinks: bool = True,
+) -> str:
+    """Atomically publish *tmp_path* at *target* without following races.
 
-    Returns the resolved real path used for the replace, so callers that
-    need to re-apply permissions can target it instead of the symlink.
+    Symlink targets are preserved by replacing their physical destination.
+    ``EBUSY`` is deliberately fail-closed: the target and source remain
+    untouched.  ``EXDEV`` gets one safe fallback that copies into a sibling
+    temporary file, fsyncs it, and performs a second replace; it never copies
+    directly over the live target.
     """
     target_str = str(target)
-    real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
     tmp_str = str(tmp_path)
-    try:
-        os.replace(tmp_str, real_path)
-    except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EBUSY):
-            raise
-        logger.debug(
-            "atomic_replace: %s -> %s failed with %s; falling back to copy",
-            tmp_str,
-            real_path,
-            errno.errorcode.get(exc.errno, exc.errno),
+    target_is_symlink = os.path.islink(target_str)
+    if target_is_symlink and not follow_symlinks:
+        from hermes_cli.config_store import UnsafeConfigPathError
+
+        raise UnsafeConfigPathError(
+            f"Configuration target changed to symlink while publishing: {target_str}"
         )
-        shutil.copyfile(tmp_str, real_path)
+    symlink = target_is_symlink
+    link_text = os.readlink(target_str) if symlink else None
+    real_path = os.path.realpath(target_str) if symlink else target_str
+    real_path_obj = Path(real_path)
+    original_mode = _preserve_file_mode(real_path_obj)
+    original_owner = _preserve_file_owner(real_path_obj)
+    original_bytes = real_path_obj.read_bytes() if real_path_obj.is_file() else None
+    try:
+        original_lstat = os.lstat(real_path)
+    except FileNotFoundError:
+        original_lstat = None
+    source_path_obj = Path(tmp_str)
+    source_bytes = source_path_obj.read_bytes()
+    if mode is not None:
+        os.chmod(tmp_str, mode)
+
+    def verify_symlink() -> None:
+        if not symlink:
+            return
+        if not os.path.islink(target_str) or os.readlink(target_str) != link_text:
+            from hermes_cli.config_store import UnsafeConfigPathError
+
+            raise UnsafeConfigPathError(
+                f"Configuration symlink was retargeted while publishing: {target_str}"
+            )
+        if os.path.realpath(target_str) != real_path:
+            from hermes_cli.config_store import UnsafeConfigPathError
+
+            raise UnsafeConfigPathError(
+                f"Configuration symlink was retargeted while publishing: {target_str}"
+            )
+
+    def verify_regular_target() -> None:
+        if symlink:
+            return
         try:
-            shutil.copystat(tmp_str, real_path)
-        except OSError:
-            pass
+            current = os.lstat(real_path)
+        except FileNotFoundError:
+            if original_lstat is None:
+                return
+            current = None
+        unchanged = (
+            original_lstat is not None
+            and current is not None
+            and stat.S_ISREG(original_lstat.st_mode)
+            and stat.S_ISREG(current.st_mode)
+            and (current.st_dev, current.st_ino)
+            == (original_lstat.st_dev, original_lstat.st_ino)
+        )
+        if not unchanged:
+            from hermes_cli.config_store import UnsafeConfigPathError
+
+            raise UnsafeConfigPathError(
+                f"Configuration target changed while publishing: {target_str}"
+            )
+
+    verify_symlink()
+    verify_regular_target()
+    fallback_tmp: str | None = None
+    replaced = False
+    try:
+        verify_regular_target()
         try:
-            with open(real_path, "rb") as f:
-                os.fsync(f.fileno())
-        except OSError:
-            pass
-        os.unlink(tmp_str)
+            os.replace(tmp_str, real_path)
+            replaced = True
+        except OSError as exc:
+            if exc.errno == errno.EBUSY:
+                raise
+            if exc.errno != errno.EXDEV:
+                raise
+            fd, fallback_tmp = tempfile.mkstemp(
+                dir=str(real_path_obj.parent),
+                prefix=f".{real_path_obj.name}.",
+                suffix=".replace.tmp",
+            )
+            try:
+                with os.fdopen(fd, "wb") as destination, open(tmp_str, "rb") as source:
+                    shutil.copyfileobj(source, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                if mode is not None:
+                    os.chmod(fallback_tmp, mode)
+                verify_regular_target()
+                os.replace(fallback_tmp, real_path)
+                replaced = True
+                fallback_tmp = None
+                os.unlink(tmp_str)
+            finally:
+                if fallback_tmp is not None:
+                    try:
+                        os.unlink(fallback_tmp)
+                    except OSError:
+                        pass
+        verify_symlink()
+        _restore_file_owner(real_path_obj, original_owner)
+        if mode is None:
+            _restore_file_mode(real_path_obj, original_mode)
+        else:
+            os.chmod(real_path_obj, mode)
+        _fsync_directory(real_path_obj.parent)
+    except BaseException as exc:
+        rollback_error: BaseException | None = None
+        if replaced:
+            rollback_tmp: str | None = None
+            try:
+                if original_bytes is None:
+                    try:
+                        real_path_obj.unlink()
+                    except FileNotFoundError:
+                        pass
+                elif not real_path_obj.is_file() or real_path_obj.read_bytes() != original_bytes:
+                    fd, rollback_tmp = tempfile.mkstemp(
+                        dir=str(real_path_obj.parent),
+                        prefix=f".{real_path_obj.name}.",
+                        suffix=".rollback.tmp",
+                    )
+                    with os.fdopen(fd, "wb") as rollback_file:
+                        rollback_file.write(original_bytes)
+                        rollback_file.flush()
+                        os.fsync(rollback_file.fileno())
+                    os.replace(rollback_tmp, real_path)
+                    rollback_tmp = None
+                    _restore_file_owner(real_path_obj, original_owner)
+                    _restore_file_mode(real_path_obj, original_mode)
+                _fsync_directory(real_path_obj.parent)
+            except BaseException as rollback_exc:
+                rollback_error = rollback_exc
+            finally:
+                if rollback_tmp is not None:
+                    try:
+                        os.unlink(rollback_tmp)
+                    except OSError:
+                        pass
+        if not source_path_obj.exists():
+            try:
+                source_path_obj.write_bytes(source_bytes)
+            except OSError:
+                pass
+        # The caller owns the source temp file; preserve it on failure so a
+        # transaction can diagnose/rollback and EBUSY is visibly fail-closed.
+        if rollback_error is not None:
+            raise RuntimeError(
+                f"atomic replacement failed and rollback failed: {rollback_error}"
+            ) from exc
+        raise
     return real_path
 
 
-def atomic_json_write(
+
+
+def _atomic_json_write_unlocked(
     path: Union[str, Path],
     data: Any,
     *,
@@ -163,9 +305,6 @@ def atomic_json_write(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    original_mode = None if mode is not None else _preserve_file_mode(path)
-    original_owner = _preserve_file_owner(path)
-
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.stem}_",
@@ -188,16 +327,7 @@ def atomic_json_write(
             f.flush()
             os.fsync(f.fileno())
         # Preserve symlinks — swap in-place on the real file (GitHub #16743).
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        if mode is not None:
-            try:
-                os.chmod(real_path_obj, mode)
-            except OSError:
-                pass
-        else:
-            _restore_file_mode(real_path_obj, original_mode)
+        atomic_replace(tmp_path, path, mode=mode)
     except BaseException:
         # Intentionally catch BaseException so temp-file cleanup still runs for
         # KeyboardInterrupt/SystemExit before re-raising the original signal.
@@ -206,6 +336,31 @@ def atomic_json_write(
         except OSError:
             pass
         raise
+
+
+def atomic_json_write(
+    path: Union[str, Path],
+    data: Any,
+    *,
+    indent: int = 2,
+    mode: int | None = None,
+    **dump_kwargs: Any,
+) -> None:
+    """Serialize in-process JSON writers before publishing atomically.
+
+    Configuration transactions already hold their physical-target
+    interprocess lock. This reentrant process lock preserves the historical
+    contract for other callers that write the same JSON target from multiple
+    threads while retaining :func:`atomic_replace`'s fail-closed target checks.
+    """
+    with _ATOMIC_JSON_WRITE_LOCK:
+        _atomic_json_write_unlocked(
+            path,
+            data,
+            indent=indent,
+            mode=mode,
+            **dump_kwargs,
+        )
 
 
 class IndentDumper(yaml.SafeDumper):
@@ -249,9 +404,6 @@ def atomic_yaml_write(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    original_mode = _preserve_file_mode(path)
-    original_owner = _preserve_file_owner(path)
-
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.stem}_",
@@ -279,10 +431,7 @@ def atomic_yaml_write(
             f.flush()
             os.fsync(f.fileno())
         # Preserve symlinks — swap in-place on the real file (GitHub #16743).
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
+        atomic_replace(tmp_path, path)
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
         # interruptions before we re-raise them.
@@ -336,8 +485,6 @@ def atomic_roundtrip_yaml_update(
         current = next_value
     current[keys[-1]] = value
 
-    original_mode = _preserve_file_mode(path)
-    original_owner = _preserve_file_owner(path)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.stem}_",
@@ -348,10 +495,7 @@ def atomic_roundtrip_yaml_update(
             yaml_rt.dump(config, f)
             f.flush()
             os.fsync(f.fileno())
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
+        atomic_replace(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)
