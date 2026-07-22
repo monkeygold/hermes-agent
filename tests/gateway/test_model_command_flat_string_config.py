@@ -11,6 +11,8 @@ before mutation, so ``--global`` succeeds and the config is rewritten in
 the proper ``model: {default: ..., provider: ...}`` form.
 """
 
+import types
+
 import yaml
 import pytest
 
@@ -199,3 +201,90 @@ async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     # Config untouched — the session override is in-memory only.
     assert written["model"]["default"] == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_model_text_switch_exception_is_not_exposed(
+    tmp_path, monkeypatch, caplog,
+):
+    """Text /model replies must not interpolate provider exception text."""
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "text-r11-faux-secret"
+
+    def _raise_switch(**_kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _raise_switch)
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    assert "saved" not in result.lower()
+    assert "--global" not in result
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "RuntimeError" in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_model_text_switch_failure_result_log_is_redacted(
+    tmp_path, monkeypatch, caplog,
+):
+    """A failed text switch result must not interpolate provider error text."""
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "text-r11-result-secret"
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: types.SimpleNamespace(success=False, error_message=secret),
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert result is not None
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_model_text_persistence_exception_has_no_global_confirmation(
+    tmp_path, monkeypatch, caplog,
+):
+    """A failed text-path global config write must not claim it was saved."""
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "text-r11-persist-secret"
+
+    def _raise_save(*_args):
+        raise OSError(secret)
+
+    monkeypatch.setattr("hermes_cli.config_store.atomic_replace", _raise_save)
+    runner = _make_runner()
+
+    result = await runner._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    assert "saved" not in result.lower()
+    assert "--global" not in result
+    assert runner._session_model_overrides == {}
+    assert getattr(runner, "_pending_model_notes", {}) == {}
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "ConfigTransactionError" in rendered_logs
+    assert "[REDACTED]" in rendered_logs

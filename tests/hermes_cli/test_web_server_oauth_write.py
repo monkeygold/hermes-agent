@@ -40,7 +40,8 @@ def test_dashboard_oauth_write_is_atomic_and_cleans_temp_on_failure(oauth_file, 
     """If the atomic replace fails, no partial file or temp file is left."""
     import utils
 
-    def flaky_replace(src, dst):
+    def flaky_replace(src, dst, *, mode=None):
+        assert mode == 0o600
         raise OSError('simulated replace failure')
 
     monkeypatch.setattr(utils, 'atomic_replace', flaky_replace)

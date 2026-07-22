@@ -572,3 +572,18 @@ def test_env_scrub_no_log_when_nothing_dropped(caplog):
             is_windows=False,
         )
     assert "dropped" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_guard_gateway_always_persistence_failure_does_not_approve(gw_session, monkeypatch):
+    """Gateway ``always`` must fail closed when config persistence fails."""
+    _register_resolver(gw_session, "always")
+    monkeypatch.setattr(
+        "hermes_cli.config_store.atomic_replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("gateway-r11-save-secret")),
+    )
+
+    result = A.check_execute_code_guard("import os; print(1)", "local")
+
+    assert result["approved"] is False
+    assert result["outcome"] == "persistence_failed"
+    assert A.is_approved(gw_session, "execute_code") is False

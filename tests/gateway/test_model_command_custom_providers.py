@@ -64,7 +64,7 @@ async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
+async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch, caplog):
     """A direct `/model <name>` switch must route switch_model() through
     asyncio.to_thread so the blocking models.dev HTTP fetch can't freeze the
     gateway event loop (#20525)."""
@@ -87,8 +87,10 @@ async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
 
     # Fail the switch so the handler returns before _finish_switch (which needs
     # full runner state) — we only care that the offload happened.
+    secret = "custom-provider-r11-result-secret"
+
     def _fake_switch(**kwargs):
-        return ModelSwitchResult(success=False, error_message="nope")
+        return ModelSwitchResult(success=False, error_message=secret)
 
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", _fake_switch)
 
@@ -105,4 +107,10 @@ async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
 
     # switch_model was offloaded to a worker thread, not run on the event loop.
     assert "_fake_switch" in offloaded
-    assert result is not None and "nope" in result
+    assert result is not None
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "ModelSwitchResult" in rendered_logs
+    assert "[REDACTED]" in rendered_logs

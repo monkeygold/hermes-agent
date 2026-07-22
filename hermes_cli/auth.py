@@ -996,11 +996,8 @@ def _same_path(left: Path, right: Path) -> bool:
 
 
 def _auth_lock_holder_for(target_path: Path) -> threading.local:
-    """Return a reentrancy tracker keyed to one canonical auth-store path."""
-    try:
-        key = str(target_path.resolve(strict=False))
-    except Exception:
-        key = str(target_path)
+    """Return a reentrancy tracker keyed to one stable logical auth path."""
+    key = os.path.abspath(os.fspath(target_path))
     with _auth_target_lock_holders_guard:
         return _auth_target_lock_holders.setdefault(key, threading.local())
 
@@ -1083,31 +1080,44 @@ def _auth_store_lock(
     *,
     target_path: Optional[Path] = None,
 ):
-    """Cross-process advisory lock for one auth.json read/write transaction.
-
-    ``target_path`` is required for profile-to-global write-throughs. A profile
-    lock does not protect the distinct global auth store; each path therefore
-    uses its own reentrancy tracker and kernel lock.
-
-    Lock ordering invariant: when this lock is held together with
-    ``_nous_shared_store_lock``, acquire ``_auth_store_lock`` FIRST
-    (outer) and the shared Nous lock SECOND (inner). All runtime
-    refresh paths follow this order; violating it risks deadlock
-    against a concurrent import on the shared store.
-    """
+    """Physical, alias-safe, reentrant lock for one auth-store transaction."""
     auth_path = target_path if target_path is not None else _auth_file_path()
-    lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
-    with _file_lock(
-        lock_path,
-        _auth_lock_holder_for(auth_path),
-        timeout_seconds,
-        "Timed out waiting for auth store lock",
-    ):
-        yield
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(auth_path)
+    holder = _auth_lock_holder_for(auth_path)
+    if getattr(holder, "depth", 0) > 0:
+        holder.depth += 1
+        try:
+            yield holder.capture
+        finally:
+            holder.depth -= 1
+        return
+
+    from hermes_cli.config_store import interprocess_lock, recover_incomplete_transactions
+
+    recover_incomplete_transactions(get_hermes_home())
+
+    with interprocess_lock(
+        auth_path,
+        home=get_hermes_home(),
+        timeout=timeout_seconds,
+    ) as capture:
+        holder.depth = 1
+        holder.capture = capture
+        try:
+            yield capture
+        finally:
+            holder.depth = 0
+            holder.capture = None
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
+    holder = _auth_lock_holder_for(auth_file)
+    if getattr(holder, "depth", 0) == 0:
+        from hermes_cli.config_store import recover_incomplete_transactions
+
+        recover_incomplete_transactions(get_hermes_home())
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
@@ -1149,56 +1159,26 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
-    # target_path=None preserves the existing contract (write the active
-    # store at _auth_file_path()). An explicit path lets callers persist a
-    # specific store — e.g. the global-root write-through for rotating xAI
-    # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
-    # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
-    # Tighten parent dir to 0o700 so siblings can't traverse to creds.
-    # No-op on Windows (POSIX mode bits not enforced); ignore failures.
-    # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
     secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(auth_store, indent=2) + "\n"
-    tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
-        # the TOCTOU window where default umask (often 0o644) briefly exposed
-        # OAuth tokens to other local users between open() and chmod().
-        # Mirrors agent/google_oauth.py (#19673) and tools/mcp_oauth.py (#21148).
-        fd = os.open(
-            str(tmp_path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            stat.S_IRUSR | stat.S_IWUSR,
+    payload = (json.dumps(auth_store, indent=2) + "\n").encode("utf-8")
+
+    from hermes_cli.config_store import publish_locked_capture, publish_transaction
+
+    holder = _auth_lock_holder_for(auth_file)
+    capture = getattr(holder, "capture", None) if getattr(holder, "depth", 0) else None
+    if capture is not None:
+        refreshed = publish_locked_capture(capture, payload, mode=0o600)
+        holder.capture = refreshed
+    else:
+        publish_transaction(
+            {auth_file: payload},
+            home=get_hermes_home(),
+            modes={auth_file: 0o600},
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        atomic_replace(tmp_path, auth_file)
-        try:
-            dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-    # Restrict file permissions to owner only
-    try:
-        auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
     return auth_file
 
 
@@ -1278,13 +1258,20 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     return state
 
 
-def _save_provider_state(auth_store: Dict[str, Any], provider_id: str, state: Dict[str, Any]) -> None:
+def _save_provider_state(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    state: Dict[str, Any],
+    *,
+    set_active: bool = True,
+) -> None:
     providers = auth_store.setdefault("providers", {})
     if not isinstance(providers, dict):
         auth_store["providers"] = {}
         providers = auth_store["providers"]
     providers[provider_id] = state
-    auth_store["active_provider"] = provider_id
+    if set_active:
+        auth_store["active_provider"] = provider_id
 
 
 def _save_provider_state_to_source(
@@ -1648,6 +1635,35 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     return False
 
 
+def _clear_provider_auth_state(
+    auth_store: Dict[str, Any],
+    target: str,
+) -> bool:
+    """Remove one provider from an already-locked auth-store mapping."""
+    providers = auth_store.get("providers", {})
+    if not isinstance(providers, dict):
+        providers = {}
+        auth_store["providers"] = providers
+
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+        auth_store["credential_pool"] = pool
+
+    cleared = False
+    if target in providers:
+        del providers[target]
+        cleared = True
+    if target in pool:
+        del pool[target]
+        cleared = True
+
+    if auth_store.get("active_provider") == target:
+        auth_store["active_provider"] = None
+        cleared = True
+    return cleared
+
+
 def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
     """
     Clear auth state for a provider. Used by `hermes logout`.
@@ -1660,29 +1676,7 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
         if not target:
             return False
 
-        providers = auth_store.get("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            auth_store["providers"] = providers
-
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            pool = {}
-            auth_store["credential_pool"] = pool
-
-        cleared = False
-        if target in providers:
-            del providers[target]
-            cleared = True
-        if target in pool:
-            del pool[target]
-            cleared = True
-
-        if auth_store.get("active_provider") == target:
-            auth_store["active_provider"] = None
-            cleared = True
-
-        if not cleared:
+        if not _clear_provider_auth_state(auth_store, target):
             return False
         _save_auth_store(auth_store)
     return True
@@ -3466,7 +3460,13 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: Optional[str] = None,
+    label: Optional[str] = None,
+    *,
+    set_active: bool = True,
+) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -3484,7 +3484,12 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _save_provider_state(
+            auth_store,
+            "openai-codex",
+            state,
+            set_active=set_active,
+        )
         _sync_codex_pool_entries(
             auth_store,
             tokens,
@@ -4113,6 +4118,7 @@ def _save_xai_oauth_tokens(
     redirect_uri: str = "",
     last_refresh: Optional[str] = None,
     auth_mode: str = "oauth_device_code",
+    set_active: bool = True,
 ) -> None:
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -4131,7 +4137,12 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        _save_provider_state(auth_store, "xai-oauth", state)
+        _save_provider_state(
+            auth_store,
+            "xai-oauth",
+            state,
+            set_active=set_active,
+        )
         _save_auth_store(auth_store)
         if write_through_to_root:
             _write_through_xai_oauth_to_global_root(state)
@@ -6641,61 +6652,89 @@ def _update_config_for_provider(
     inference_base_url: str,
     default_model: Optional[str] = None,
 ) -> Path:
-    """Update config.yaml and auth.json to reflect the active provider.
+    """Atomically update auth.json and config.yaml for the active provider."""
+    import yaml as _yaml
 
-    When *default_model* is provided the function also writes it as the
-    ``model.default`` value.  This prevents a race condition where the
-    gateway (which re-reads config per-message) picks up the new provider
-    before the caller has finished model selection, resulting in a
-    mismatched model/provider (e.g. ``anthropic/claude-opus-4.6`` sent to
-    MiniMax's API).
-    """
-    # Set active_provider in auth.json so auto-resolution picks this provider
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        auth_store["active_provider"] = provider_id
-        _save_auth_store(auth_store)
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        clear_model_endpoint_credentials,
+        invalidate_config_caches,
+        is_managed,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
 
-    # Update config.yaml model section
+    if is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot update provider configuration in managed mode"
+        )
+    auth_path = _auth_file_path()
     config_path = get_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(auth_path)
     require_readable_config_before_write(config_path)
 
-    config = read_raw_config()
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        auth_raw = current[auth_path]
+        if auth_raw is None:
+            auth_store: Dict[str, Any] = {
+                "version": AUTH_STORE_VERSION,
+                "providers": {},
+            }
+        else:
+            parsed_auth = json.loads(auth_raw.decode("utf-8"))
+            if not isinstance(parsed_auth, dict):
+                raise ValueError("auth.json must contain an object")
+            auth_store = parsed_auth
+            auth_store.setdefault("providers", {})
+        auth_store["active_provider"] = provider_id
+        auth_store["version"] = AUTH_STORE_VERSION
+        auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        model_cfg = dict(current_model)
-    elif isinstance(current_model, str) and current_model.strip():
-        model_cfg = {"default": current_model.strip()}
-    else:
-        model_cfg = {}
+        config_raw = current[config_path]
+        parsed_config = (
+            _yaml.safe_load(config_raw.decode("utf-8"))
+            if config_raw is not None
+            else {}
+        )
+        if parsed_config is None:
+            parsed_config = {}
+        if not isinstance(parsed_config, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        config = parsed_config
 
-    model_cfg["provider"] = provider_id
-    if inference_base_url and inference_base_url.strip():
-        model_cfg["base_url"] = inference_base_url.rstrip("/")
-    else:
-        # Clear stale base_url to prevent contamination when switching providers
-        model_cfg.pop("base_url", None)
+        current_model = config.get("model")
+        if isinstance(current_model, dict):
+            model_cfg = dict(current_model)
+        elif isinstance(current_model, str) and current_model.strip():
+            model_cfg = {"default": current_model.strip()}
+        else:
+            model_cfg = {}
+        model_cfg["provider"] = provider_id
+        if inference_base_url and inference_base_url.strip():
+            model_cfg["base_url"] = inference_base_url.rstrip("/")
+        else:
+            model_cfg.pop("base_url", None)
+        clear_model_endpoint_credentials(model_cfg)
+        if default_model:
+            cur_default = model_cfg.get("default", "")
+            if not cur_default or "/" in cur_default:
+                model_cfg["default"] = default_model
+        config["model"] = model_cfg
 
-    # Clear stale endpoint credentials left over from a previous custom provider.
-    # Built-in providers resolve credentials from env/auth state, not inline
-    # model.api_key.
-    from hermes_cli.config import clear_model_endpoint_credentials
+        return {
+            auth_path: (json.dumps(auth_store, indent=2) + "\n").encode("utf-8"),
+            config_path: serialize_yaml_bytes(config, sort_keys=False),
+        }
 
-    clear_model_endpoint_credentials(model_cfg)
-
-    # When switching to a non-OpenRouter provider, ensure model.default is
-    # valid for the new provider.  An OpenRouter-formatted name like
-    # "anthropic/claude-opus-4.6" will fail on direct-API providers.
-    if default_model:
-        cur_default = model_cfg.get("default", "")
-        if not cur_default or "/" in cur_default:
-            model_cfg["default"] = default_model
-
-    config["model"] = model_cfg
-
-    atomic_yaml_write(config_path, config, sort_keys=False)
+    update_transaction(
+        [auth_path, config_path],
+        _update,
+        home=get_hermes_home(),
+        modes={auth_path: 0o600},
+    )
+    invalidate_config_caches(config_path)
     return config_path
 
 
@@ -6742,29 +6781,139 @@ def _logout_default_provider_from_config() -> Optional[str]:
     "No provider is currently logged in" and never reset model.provider.
     """
     provider = _get_config_provider()
-    if provider in {"nous", "openai-codex", "xai-oauth"}:
+    config = PROVIDER_REGISTRY.get(provider or "")
+    if config is not None and config.auth_type.startswith("oauth_"):
         return provider
     return None
 
 
 def _reset_config_provider() -> Path:
-    """Reset config.yaml provider back to auto after logout."""
+    """Reset config.yaml provider under the shared config transaction lock."""
+    import yaml as _yaml
+
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        invalidate_config_caches,
+        is_managed,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
+
+    if is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot reset provider configuration in managed mode"
+        )
     config_path = get_config_path()
     if not config_path.exists():
         return config_path
     require_readable_config_before_write(config_path)
+    changed = False
 
-    config = read_raw_config()
-    if not config:
-        return config_path
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        nonlocal changed
+        raw = current[config_path]
+        if raw is None:
+            return {}
+        config = _yaml.safe_load(raw.decode("utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        model = config.get("model")
+        if not isinstance(model, dict):
+            return {}
+        updated_model = dict(model)
+        updated_model["provider"] = "auto"
+        if "base_url" in updated_model:
+            updated_model["base_url"] = OPENROUTER_BASE_URL
+        if updated_model == model:
+            return {}
+        config["model"] = updated_model
+        changed = True
+        return {config_path: serialize_yaml_bytes(config, sort_keys=False)}
 
-    model = config.get("model")
-    if isinstance(model, dict):
-        model["provider"] = "auto"
-        if "base_url" in model:
-            model["base_url"] = OPENROUTER_BASE_URL
-    atomic_yaml_write(config_path, config, sort_keys=False)
+    update_transaction([config_path], _update, home=get_hermes_home())
+    if changed:
+        invalidate_config_caches(config_path)
     return config_path
+
+
+def _logout_provider_transaction(
+    target: str,
+    *,
+    reset_config: bool,
+) -> tuple[bool, bool]:
+    """Clear auth and reset config in one rollback-capable transaction."""
+    import yaml as _yaml
+
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        invalidate_config_caches,
+        is_managed,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
+
+    # Refuse before lock roots, temporary files, or either target can change.
+    if reset_config and is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot reset provider configuration in managed mode"
+        )
+
+    auth_path = _auth_file_path()
+    config_path = get_config_path()
+    targets = [auth_path]
+    if reset_config:
+        require_readable_config_before_write(config_path)
+        targets.append(config_path)
+
+    outcome = {"auth_cleared": False, "config_reset": False}
+
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        writes: Dict[Path, bytes] = {}
+
+        auth_raw = current[auth_path]
+        if auth_raw is not None:
+            auth_store = json.loads(auth_raw.decode("utf-8"))
+            if not isinstance(auth_store, dict):
+                raise ValueError("auth.json must contain an object")
+            if _clear_provider_auth_state(auth_store, target):
+                auth_store["version"] = AUTH_STORE_VERSION
+                auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+                writes[auth_path] = (
+                    json.dumps(auth_store, indent=2) + "\n"
+                ).encode("utf-8")
+                outcome["auth_cleared"] = True
+
+        if reset_config:
+            config_raw = current[config_path]
+            if config_raw is not None:
+                config = _yaml.safe_load(config_raw.decode("utf-8"))
+                if not isinstance(config, dict):
+                    raise ValueError("config.yaml must contain a mapping")
+                model = config.get("model")
+                if isinstance(model, dict):
+                    current_provider = str(model.get("provider") or "").strip().lower()
+                    if current_provider == target.strip().lower():
+                        updated_model = dict(model)
+                        updated_model["provider"] = "auto"
+                        if "base_url" in updated_model:
+                            updated_model["base_url"] = OPENROUTER_BASE_URL
+                        config["model"] = updated_model
+                        writes[config_path] = serialize_yaml_bytes(
+                            config,
+                            sort_keys=False,
+                        )
+                        outcome["config_reset"] = True
+        return writes
+
+    update_transaction(targets, _update, home=get_hermes_home())
+    if outcome["auth_cleared"]:
+        try:
+            Path(os.path.realpath(auth_path)).chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+    if outcome["config_reset"]:
+        invalidate_config_caches(config_path)
+    return outcome["auth_cleared"], outcome["config_reset"]
 
 
 def _confirm_expensive_model_selection(
@@ -7074,7 +7223,7 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
+                _save_codex_tokens(cli_tokens, set_active=False)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
@@ -7092,7 +7241,11 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(
+        creds["tokens"],
+        creds.get("last_refresh"),
+        set_active=False,
+    )
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
@@ -7151,6 +7304,7 @@ def _login_xai_oauth(
         redirect_uri=creds.get("redirect_uri", ""),
         last_refresh=creds.get("last_refresh"),
         auth_mode="oauth_device_code",
+        set_active=False,
     )
     # An explicit interactive re-login is a strong signal the user wants the
     # xAI credential re-enabled. ``hermes auth remove xai-oauth`` leaves a
@@ -8273,7 +8427,12 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
 
         with _auth_store_lock():
             auth_store = _load_auth_store()
-            _save_provider_state(auth_store, "nous", auth_state)
+            _save_provider_state(
+                auth_store,
+                "nous",
+                auth_state,
+                set_active=False,
+            )
             saved_to = _save_auth_store(auth_store)
 
         # Mirror to the shared store so other profiles can one-tap import
@@ -8432,13 +8591,15 @@ def logout_command(args) -> None:
     should_reset_config = _should_reset_config_provider_on_logout(target)
     provider_name = get_auth_provider_display_name(target)
 
-    if clear_provider_auth(target) or should_reset_config:
-        if should_reset_config:
-            _reset_config_provider()
+    auth_cleared, config_reset = _logout_provider_transaction(
+        target,
+        reset_config=should_reset_config,
+    )
+    if auth_cleared or config_reset:
         print(f"Logged out of {provider_name}.")
-        if should_reset_config and os.getenv("OPENROUTER_API_KEY"):
+        if config_reset and os.getenv("OPENROUTER_API_KEY"):
             print("Hermes will use OpenRouter for inference.")
-        elif should_reset_config:
+        elif config_reset:
             print("Run `hermes model` or configure an API key to use Hermes.")
         else:
             print("Model provider configuration was unchanged.")

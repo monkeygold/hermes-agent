@@ -14,6 +14,7 @@ import functools
 import hashlib
 import logging
 import os
+from pathlib import Path
 import re
 import shlex
 import sys
@@ -22,6 +23,7 @@ import threading
 import time
 import unicodedata
 from typing import Optional
+import yaml
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -943,19 +945,17 @@ def _home_prefix_fold_regex(path: str):
     patterns (``~/.ssh/authorized_keys``) still match. The trailing tail is
     required (``+``), so a bare home with no path under it is not folded.
 
-    Returns ``None`` for an unset or degenerate path — one with fewer than two
-    components below the root — so a stray HOME / HERMES_HOME such as ``/``,
-    ``C:\\`` or ``""`` cannot rewrite unrelated filesystem prefixes. Cached
+    Returns ``None`` for an unset or degenerate root path.  A POSIX root-level
+    home such as ``/root`` is valid and must be folded; a bare ``/``, Windows
+    drive root such as ``C:\\``, or ``""`` must not rewrite unrelated paths. Cached
     because the resolved home is stable across calls on this hot path.
     """
     if not path:
         return None
     components = [c for c in re.split(r"[/\\]+", path) if c]
-    # Require at least two non-empty components below the root. For POSIX this
-    # mirrors the historical ``count("/") >= 2`` guard (``/home/alice`` folds,
-    # ``/home`` does not); for Windows it rejects a bare drive root (``C:\\``)
-    # while accepting a real home (``C:\\Users\\alice``).
-    if len(components) < 2:
+    if not components:
+        return None
+    if len(components) == 1 and re.fullmatch(r"[A-Za-z]:", components[0]):
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
     # Optional leading root separator (POSIX ``/`` or UNC ``\\``); a Windows
@@ -1985,6 +1985,20 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
 
+def _is_noncanonical_verification_artifact_cleanup(command: str) -> bool:
+    """Return whether *command* imitates a Hermes cleanup outside its safe path."""
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
+        return False
+    basename = os.path.basename(argv[2])
+    return re.fullmatch(
+        r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename
+    ) is not None
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -1995,6 +2009,9 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    if _is_noncanonical_verification_artifact_cleanup(command):
+        description = "non-canonical Hermes verification artifact delete"
+        return (True, description, description)
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
@@ -2017,6 +2034,8 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
+_allowlist_persist_lock = threading.RLock()
+_last_allowlist_config_signature = None
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -2175,24 +2194,25 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
     """
+    permanent_approved = _refresh_permanent_allowlist_if_changed()
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
-        if any(alias in _permanent_approved for alias in aliases):
+        if any(alias in permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
         return any(alias in session_approvals for alias in aliases)
 
 
 def approve_permanent(pattern_key: str):
-    """Add a pattern to the permanent allowlist."""
-    with _lock:
-        _permanent_approved.add(pattern_key)
+    """Compatibility wrapper for the atomic permanent-approval primitive."""
+    approve_always(pattern_key)
 
 
 def load_permanent(patterns: set):
-    """Bulk-load permanent allowlist entries from config."""
+    """Replace the in-process permanent allowlist with *patterns*."""
     with _lock:
-        _permanent_approved.update(patterns)
+        _permanent_approved.clear()
+        _permanent_approved.update(_coerce_allowlist_patterns(patterns))
 
 
 _ALLOWLIST_SHELL_OPERATOR_RE = re.compile(r"(?:\n|&&|\|\||[;&|<>`]|\$\()")
@@ -2210,14 +2230,14 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
     ``recursive delete``. Manual entries in ``command_allowlist`` are command
     text, and may include shell-style wildcards like ``podman *``.
     """
+    permanent_approved = _refresh_permanent_allowlist_if_changed()
     command = (command or "").strip()
     if not command:
         return False
     if _has_allowlist_shell_operator(command):
         return False
 
-    with _lock:
-        patterns = tuple(_permanent_approved)
+    patterns = tuple(permanent_approved)
 
     for pattern in patterns:
         if not isinstance(pattern, str):
@@ -2237,33 +2257,201 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
 # Config persistence for permanent allowlist
 # =========================================================================
 
+
+class AllowlistPersistenceError(RuntimeError):
+    """Raised when a permanent approval could not be persisted."""
+
+
+def _coerce_allowlist_patterns(raw) -> set[str]:
+    """Normalize current and legacy command_allowlist representations."""
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        return {raw} if raw.strip() else set()
+    if isinstance(raw, dict):
+        for key in ("patterns", "allowlist", "commands", "entries"):
+            if key in raw:
+                return _coerce_allowlist_patterns(raw[key])
+        # Some early configs used a mapping of pattern -> enabled.
+        return {str(key) for key, enabled in raw.items() if enabled}
+    try:
+        return {item for item in raw if isinstance(item, str) and item.strip()}
+    except TypeError:
+        return set()
+
+
+def _read_allowlist_config_snapshot():
+    """Read allowlist bytes and signature from one stable file descriptor."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = Path(get_hermes_home()) / "config.yaml"
+        with path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
+            raw = handle.read()
+        signature = (
+            str(path),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_mtime_ns,
+            stat.st_size,
+            hashlib.sha256(raw).digest(),
+        )
+        try:
+            parsed = yaml.safe_load(raw.decode("utf-8"))
+            patterns = _coerce_allowlist_patterns(
+                parsed.get("command_allowlist") if isinstance(parsed, dict) else None
+            )
+        except (UnicodeDecodeError, yaml.YAMLError):
+            patterns = set()
+        return patterns, signature
+    except OSError:
+        return set(), None
+
+
+def _allowlist_config_signature():
+    """Return a content-bound disk signature used for hot-process revocation."""
+    _patterns, signature = _read_allowlist_config_snapshot()
+    return signature
+
+
+def _refresh_permanent_allowlist_if_changed() -> frozenset[str]:
+    """Return one profile-local disk snapshot and refresh compatibility state."""
+    global _last_allowlist_config_signature
+
+    patterns, signature = _read_allowlist_config_snapshot()
+    changed = False
+    with _lock:
+        if signature != _last_allowlist_config_signature:
+            _permanent_approved.clear()
+            _permanent_approved.update(patterns)
+            _last_allowlist_config_signature = signature
+            changed = True
+            current = frozenset(patterns)
+        else:
+            # Preserve the legacy load_permanent() API when no disk identity
+            # changed, but snapshot it before another profile can refresh.
+            current = frozenset(_permanent_approved)
+    if changed:
+        from hermes_cli.config import get_config_path, invalidate_config_caches
+
+        invalidate_config_caches(get_config_path())
+    return current
+
+
+def _permanent_persistence_failure(pattern_key=None, pattern_keys=None) -> dict:
+    """Return the common fail-closed result for an ``always`` write failure."""
+    keys = pattern_keys or ([pattern_key] if pattern_key else [])
+    return {
+        "approved": False,
+        "message": (
+            "BLOCKED: Permanent approval could not be saved; "
+            "the action was not approved."
+        ),
+        "pattern_key": pattern_key,
+        "pattern_keys": list(keys),
+        "outcome": "persistence_failed",
+        "user_consent": False,
+    }
+
 def load_permanent_allowlist() -> set:
     """Load permanently allowed command patterns from config.
 
     Also syncs them into the approval module so is_approved() works for
     patterns added via 'always' in a previous session.
     """
+    global _last_allowlist_config_signature
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        patterns = set(config.get("command_allowlist", []) or [])
-        if patterns:
-            load_permanent(patterns)
-        return patterns
-    except Exception as e:
-        logger.warning("Failed to load permanent allowlist: %s", e)
-        return set()
+        patterns, signature = _read_allowlist_config_snapshot()
+    except Exception as exc:
+        logger.warning(
+            "Failed to load permanent allowlist (%s)",
+            type(exc).__name__,
+        )
+        patterns = set()
+        signature = None
+    load_permanent(patterns)
+    _last_allowlist_config_signature = signature
+    return patterns
+
+
+def _persist_permanent_allowlist(patterns: set[str], *, merge: bool) -> set[str]:
+    """Persist an exact or merged allowlist from a lock-protected disk snapshot."""
+    import yaml
+
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        get_config_path,
+        get_hermes_home,
+        invalidate_config_caches,
+        is_managed,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
+
+    if is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot persist permanent approval rules in managed mode"
+        )
+    config_path = get_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate: set[str] = set()
+
+    def _update(current: dict[Path, bytes | None]) -> dict[Path, bytes]:
+        nonlocal candidate
+        transaction_path = next(iter(current))
+        raw = current[transaction_path]
+        parsed = yaml.safe_load(raw.decode("utf-8")) if raw is not None else {}
+        if parsed is None:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        disk_patterns = _coerce_allowlist_patterns(parsed.get("command_allowlist"))
+        candidate = disk_patterns | patterns if merge else set(patterns)
+        parsed["command_allowlist"] = sorted(candidate)
+        return {transaction_path: serialize_yaml_bytes(parsed, sort_keys=False)}
+
+    update_transaction([config_path], _update, home=get_hermes_home())
+    invalidate_config_caches(config_path)
+    return candidate
 
 
 def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
+    """Save an exact allowlist, publishing memory only after the write."""
+    normalized = _coerce_allowlist_patterns(patterns)
     try:
-        from hermes_cli.config import load_config, save_config
-        config = load_config()
-        config["command_allowlist"] = list(patterns)
-        save_config(config)
-    except Exception as e:
-        logger.warning("Could not save allowlist: %s", e)
+        candidate = _persist_permanent_allowlist(normalized, merge=False)
+    except Exception as exc:
+        logger.warning("Could not save allowlist (%s)", type(exc).__name__)
+        raise AllowlistPersistenceError(
+            "Permanent approval could not be persisted"
+        ) from exc
+    load_permanent(candidate)
+
+
+def approve_always(pattern_keys, session_key: str | None = None) -> set[str]:
+    """Merge a permanent approval before publishing session or memory state."""
+    normalized = _coerce_allowlist_patterns(pattern_keys)
+    if not normalized:
+        return set()
+
+    with _allowlist_persist_lock:
+        try:
+            candidate = _persist_permanent_allowlist(normalized, merge=True)
+        except Exception as exc:
+            logger.warning(
+                "Could not persist permanent approval (%s)",
+                type(exc).__name__,
+            )
+            raise AllowlistPersistenceError(
+                "Permanent approval could not be persisted"
+            ) from exc
+
+        load_permanent(candidate)
+        if session_key:
+            with _lock:
+                _session_approved.setdefault(session_key, set()).update(normalized)
+        return candidate
 
 
 # =========================================================================
@@ -2299,8 +2487,8 @@ def prompt_dangerous_approval(command: str, description: str,
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_description = redact_sensitive_text(description)
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
 
     if approval_callback is not None:
         try:
@@ -2332,7 +2520,7 @@ def prompt_dangerous_approval(command: str, description: str,
                 "Dangerous-command approval requested on a thread with no "
                 "approval callback while prompt_toolkit is active; denying "
                 "to avoid stdin deadlock. command=%r description=%r",
-                command, description,
+                display_command, display_description,
             )
             return "deny"
     except Exception:
@@ -2804,9 +2992,10 @@ def _run_approval_gate(
             if choice == "session":
                 approve_session(session_key, pattern_key)
             elif choice == "always":
-                approve_session(session_key, pattern_key)
-                approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+                try:
+                    approve_always(pattern_key, session_key)
+                except AllowlistPersistenceError:
+                    return _permanent_persistence_failure(pattern_key=pattern_key)
             return {"approved": True, "message": None}
 
         # No notify callback (e.g. API server without an attached chat):
@@ -2846,9 +3035,10 @@ def _run_approval_gate(
     if choice == "session":
         approve_session(session_key, pattern_key)
     elif choice == "always":
-        approve_session(session_key, pattern_key)
-        approve_permanent(pattern_key)
-        save_permanent_allowlist(_permanent_approved)
+        try:
+            approve_always(pattern_key, session_key)
+        except AllowlistPersistenceError:
+            return _permanent_persistence_failure(pattern_key=pattern_key)
 
     return {"approved": True, "message": None}
 
@@ -3507,13 +3697,22 @@ def check_all_command_guards(command: str, env_type: str,
             # older client returns "session" or "always". Manual and ESCALATE
             # choices retain their existing persistence semantics.
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if choice == "session" or (choice == "always" and is_tirith):
+                if choice == "session":
+                    for key, _, _ in warnings:
                         approve_session(session_key, key)
-                    elif choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                elif choice == "always":
+                    permanent_keys = [key for key, _, is_tirith in warnings if not is_tirith]
+                    try:
+                        if permanent_keys:
+                            approve_always(permanent_keys, session_key)
+                    except AllowlistPersistenceError:
+                        return _permanent_persistence_failure(
+                            pattern_key=primary_key,
+                            pattern_keys=all_keys,
+                        )
+                    for key, _, is_tirith in warnings:
+                        if is_tirith:
+                            approve_session(session_key, key)
 
             return {"approved": True, "message": None,
                     "user_approved": True, "description": combined_desc}
@@ -3598,15 +3797,24 @@ def check_all_command_guards(command: str, env_type: str,
     # Smart-DENY owner overrides are one-operation scoped. Preserve existing
     # persistence for manual mode and smart ESCALATE.
     if not smart_denied_for_owner:
-        for key, _, is_tirith in warnings:
-            if choice == "session" or (choice == "always" and is_tirith):
-                # tirith: session only (no permanent broad allowlisting)
+        if choice == "session":
+            for key, _, _ in warnings:
                 approve_session(session_key, key)
-            elif choice == "always":
-                # dangerous patterns: permanent allowed
-                approve_session(session_key, key)
-                approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
+        elif choice == "always":
+            # Tirith findings remain session-only; persist all other warning
+            # keys in one transaction before publishing approval state.
+            permanent_keys = [key for key, _, is_tirith in warnings if not is_tirith]
+            try:
+                if permanent_keys:
+                    approve_always(permanent_keys, session_key)
+            except AllowlistPersistenceError:
+                return _permanent_persistence_failure(
+                    pattern_key=primary_key,
+                    pattern_keys=all_keys,
+                )
+            for key, _, is_tirith in warnings:
+                if is_tirith:
+                    approve_session(session_key, key)
 
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
@@ -3828,9 +4036,10 @@ def check_execute_code_guard(code: str, env_type: str,
         if choice == "session":
             approve_session(session_key, pattern_key)
         elif choice == "always":
-            approve_session(session_key, pattern_key)
-            approve_permanent(pattern_key)
-            save_permanent_allowlist(_permanent_approved)
+            try:
+                approve_always(pattern_key, session_key)
+            except AllowlistPersistenceError:
+                return _permanent_persistence_failure(pattern_key=pattern_key)
     # choice == "once": no persistence — approval lasts this single call only.
 
     return {"approved": True, "message": None,

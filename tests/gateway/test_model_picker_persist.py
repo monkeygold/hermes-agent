@@ -18,6 +18,7 @@ callback and assert ``config.yaml`` is (or isn't) updated — exercising the exa
 closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
+import threading
 import types
 
 import yaml
@@ -323,3 +324,139 @@ async def test_multiplex_picker_global_persists_only_named_profile(
     assert written["marker"] == "named"
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_picker_switch_exception_is_not_exposed(tmp_path, monkeypatch, caplog):
+    """Picker replies must not expose provider exception text or secrets."""
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "picker-r11-faux-secret"
+
+    def _raise_switch(**_kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _raise_switch)
+
+    reply = await _drive_picker(_make_runner(adapter), _make_event("/model --global"))
+
+    assert secret not in reply
+    assert "model switch failed" in reply.lower()
+    assert "saved" not in reply.lower()
+    assert "--global" not in reply
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "RuntimeError" in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_picker_switch_exception_result_message_is_not_exposed(
+    tmp_path, monkeypatch, caplog,
+):
+    """A failed switch result must not interpolate its provider error message."""
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "picker-r11-result-secret"
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: types.SimpleNamespace(success=False, error_message=secret),
+    )
+
+    reply = await _drive_picker(_make_runner(adapter), _make_event("/model --global"))
+
+    assert secret not in reply
+    assert "model switch failed" in reply.lower()
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_picker_persistence_exception_has_no_global_confirmation(
+    tmp_path, monkeypatch, caplog,
+):
+    """A global config write failure must not claim that it was saved."""
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "picker-r11-persist-secret"
+
+    def _raise_save(*_args):
+        raise OSError(secret)
+
+    monkeypatch.setattr("hermes_cli.config_store.atomic_replace", _raise_save)
+    runner = _make_runner(adapter)
+
+    reply = await _drive_picker(runner, _make_event("/model --global"))
+
+    assert secret not in reply
+    assert "model switch failed" in reply.lower()
+    assert "saved" not in reply.lower()
+    assert "--global" not in reply
+    assert runner._session_model_overrides == {}
+    assert getattr(runner, "_pending_model_notes", {}) == {}
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "ConfigTransactionError" in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_picker_persistence_failure_rolls_back_to_live_cached_agent_state(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "picker-open-model", "provider": "picker-open-provider"},
+    )
+    runner = _make_runner(adapter)
+    monkeypatch.setattr(runner, "_agent_cache_lock", threading.Lock(), raising=False)
+    monkeypatch.setattr(runner, "_agent_cache", {}, raising=False)
+    event = _make_event("/model --global")
+
+    await runner._handle_model_command(event)
+    assert adapter.captured_callback is not None
+
+    calls = []
+
+    class CachedAgent:
+        model = "runtime-model"
+        provider = "runtime-provider"
+        api_key = "runtime-key"
+        base_url = "https://runtime.invalid/v1"
+        api_mode = "runtime-mode"
+
+        def switch_model(self, **kwargs):
+            calls.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.api_key = kwargs["api_key"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+
+    session_key = runner._session_key_for_source(event.source)
+    runner._agent_cache[session_key] = (CachedAgent(), 0, None)
+
+    def fail_persist(*_args, **_kwargs):
+        raise OSError("injected persistence failure")
+
+    monkeypatch.setattr("hermes_cli.config_store.atomic_replace", fail_persist)
+
+    reply = await adapter.captured_callback("12345", "gpt-5.5", "openrouter")
+
+    assert "model switch failed" in reply.lower()
+    assert calls[-1] == {
+        "new_model": "runtime-model",
+        "new_provider": "runtime-provider",
+        "api_key": "runtime-key",
+        "base_url": "https://runtime.invalid/v1",
+        "api_mode": "runtime-mode",
+    }

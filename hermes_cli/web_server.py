@@ -54,6 +54,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
+    ManagedConfigWriteError,
     cfg_get,
     DEFAULT_CONFIG,
     OPTIONAL_ENV_VARS,
@@ -61,6 +62,7 @@ from hermes_cli.config import (
     get_config_path,
     get_env_path,
     get_hermes_home,
+    is_managed,
     load_config,
     load_env,
     read_raw_config,
@@ -125,6 +127,16 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+
+
+def _log_redacted_internal_error(surface: str, exc: BaseException) -> None:
+    """Log a correlation-safe failure without exception values or traceback."""
+    _log.error(
+        "%s failed (%s): [REDACTED]",
+        surface,
+        type(exc).__name__,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
@@ -5048,30 +5060,6 @@ def _coerce_schema_field(field: Dict[str, Any], raw: Any) -> Any:
     return value or _field_default(field)
 
 
-def _save_memory_provider_native_config(name: str, provider: Any, values: Dict[str, Any]) -> None:
-    if provider is not None and hasattr(provider, "save_config"):
-        try:
-            from agent.memory_provider import MemoryProvider as _BaseMemoryProvider
-        except Exception:
-            provider.save_config(values, str(get_hermes_home()))
-            return
-        if type(provider).save_config is not _BaseMemoryProvider.save_config:
-            provider.save_config(values, str(get_hermes_home()))
-            return
-
-    cfg = load_config()
-    memory_cfg = cfg.get("memory")
-    if not isinstance(memory_cfg, dict):
-        memory_cfg = {}
-        cfg["memory"] = memory_cfg
-    current = memory_cfg.get(name)
-    if not isinstance(current, dict):
-        current = {}
-    current.update(values)
-    memory_cfg[name] = current
-    save_config(cfg)
-
-
 def _memory_provider_is_configured(name: str, provider: Any) -> bool:
     data = _read_memory_provider_existing_values(name)
     fields = _normalize_memory_provider_schema(name, provider)
@@ -5163,11 +5151,120 @@ def _require_memory_provider_ready(name: str) -> None:
         )
 
 
+def _memory_provider_has_native_writer(provider: Any) -> bool:
+    writer = getattr(provider, "save_config", None)
+    if not callable(writer):
+        return False
+    try:
+        from agent.memory_provider import MemoryProvider as _BaseMemoryProvider
+    except Exception:
+        return True
+    return getattr(type(provider), "save_config", None) is not _BaseMemoryProvider.save_config
+
+
+def _collect_memory_provider_stage_files(stage_home: Path) -> Dict[Path, bytes]:
+    """Collect regular provider outputs relative to a disposable HERMES_HOME."""
+
+    outputs: Dict[Path, bytes] = {}
+    for root, dirnames, filenames in os.walk(stage_home, followlinks=False):
+        root_path = Path(root)
+        for dirname in tuple(dirnames):
+            directory = root_path / dirname
+            if directory.is_symlink():
+                raise RuntimeError("Memory-provider config writer created a symlink")
+            relative_dir = directory.relative_to(stage_home)
+            if relative_dir.parts and relative_dir.parts[0] == ".config-locks":
+                dirnames.remove(dirname)
+        for filename in filenames:
+            path = root_path / filename
+            relative = path.relative_to(stage_home)
+            if relative.parts and relative.parts[0] == ".config-locks":
+                continue
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("Memory-provider config writer created a non-regular file")
+            outputs[relative] = path.read_bytes()
+    return outputs
+
+
+def _render_memory_provider_stage(
+    provider: Any,
+    values: Dict[str, Any],
+    seed: Dict[Path, bytes | None],
+) -> Dict[Path, bytes]:
+    """Run an imperative provider writer only against disposable state."""
+
+    with tempfile.TemporaryDirectory(prefix="hermes-memory-provider-") as temp_dir:
+        stage_home = Path(temp_dir)
+        for relative, content in seed.items():
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError("Memory-provider config path escaped staging")
+            if content is None:
+                continue
+            staged = stage_home / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(content)
+        provider.save_config(values, str(stage_home))
+        return _collect_memory_provider_stage_files(stage_home)
+
+
+def _ensure_memory_provider_target_parents(
+    home: Path,
+    targets: List[Path],
+) -> List[Path]:
+    """Create only missing provider subdirectories; caller removes them on failure."""
+
+    created: List[Path] = []
+    try:
+        for target in targets:
+            try:
+                target.relative_to(home)
+            except ValueError as exc:
+                raise RuntimeError("Memory-provider config path escaped HERMES_HOME") from exc
+            missing: List[Path] = []
+            parent = target.parent
+            while parent != home and not parent.exists():
+                missing.append(parent)
+                parent = parent.parent
+            for directory in reversed(missing):
+                directory.mkdir(mode=0o700)
+                created.append(directory)
+    except BaseException:
+        for directory in reversed(created):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
+    return created
+
+
 def _write_memory_provider_config_values(
     name: str,
     provider: Any,
     values: Dict[str, Any],
+    *,
+    activate: bool = False,
 ) -> None:
+    """Persist native config, secrets, and optional activation as one transaction."""
+
+    from hermes_cli import managed_scope
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        _CONFIG_LOCK,
+        _set_env_bytes,
+        invalidate_config_caches,
+        invalidate_env_cache,
+        is_managed,
+        require_readable_config_before_write,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
+
+    if is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot update memory-provider configuration in managed mode"
+        )
     existing = _read_memory_provider_existing_values(name)
     fields = _normalize_memory_provider_schema(name, provider)
     fields_by_key = {field["key"]: field for field in fields}
@@ -5191,10 +5288,147 @@ def _write_memory_provider_config_values(
         )
         config_values[field["key"]] = _coerce_schema_field(field, raw)
 
-    _save_memory_provider_native_config(name, provider, config_values)
+    if any(managed_scope.is_env_managed(key) for key in secrets):
+        raise ManagedConfigWriteError(
+            "Cannot update memory-provider secrets managed by an administrator"
+        )
 
+    runtime_updates: Dict[str, str] = {}
     for env_key, secret in secrets.items():
-        save_env_value(env_key, secret)
+        _serialized, clean_value = _set_env_bytes(None, env_key, secret)
+        if "\x00" in clean_value:
+            raise ValueError("Invalid memory-provider environment value")
+        runtime_updates[env_key] = clean_value
+    runtime_missing = object()
+    runtime_before: Dict[str, str | object] = {
+        env_key: os.environ.get(env_key, runtime_missing)
+        for env_key in runtime_updates
+    }
+
+    home = get_hermes_home()
+    config_path = get_config_path()
+    env_path = get_env_path()
+    has_native_writer = _memory_provider_has_native_writer(provider)
+
+    native_relative_paths: List[Path] = []
+    if has_native_writer:
+        discovered = _render_memory_provider_stage(provider, config_values, {})
+        native_relative_paths = sorted(discovered, key=lambda path: str(path))
+
+    native_targets = [home / relative for relative in native_relative_paths]
+    config_is_native = config_path in native_targets
+    needs_config = activate or not has_native_writer or config_is_native
+
+    targets = list(native_targets)
+    if secrets and env_path not in targets:
+        targets.append(env_path)
+    if needs_config and config_path not in targets:
+        targets.append(config_path)
+
+    if needs_config:
+        require_readable_config_before_write(config_path)
+
+    created_dirs = _ensure_memory_provider_target_parents(home, native_targets)
+
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        updates: Dict[Path, bytes] = {}
+
+        if has_native_writer:
+            seed = {
+                relative: current[target]
+                for relative, target in zip(native_relative_paths, native_targets)
+            }
+            rendered = _render_memory_provider_stage(provider, config_values, seed)
+            if set(rendered) != set(native_relative_paths):
+                raise RuntimeError("Memory-provider config targets changed during transaction")
+            updates.update(
+                {
+                    target: rendered[relative]
+                    for relative, target in zip(native_relative_paths, native_targets)
+                }
+            )
+
+        if secrets:
+            env_bytes = current[env_path]
+            for env_key, secret in secrets.items():
+                env_bytes, clean_value = _set_env_bytes(env_bytes, env_key, secret)
+                if clean_value != runtime_updates[env_key]:
+                    raise RuntimeError("Memory-provider environment value changed during transaction")
+            assert env_bytes is not None
+            updates[env_path] = env_bytes
+
+        if needs_config:
+            config_bytes = updates.get(config_path, current[config_path])
+            config_data = yaml.safe_load(
+                config_bytes.decode("utf-8-sig") if config_bytes is not None else ""
+            ) or {}
+            if not isinstance(config_data, dict):
+                raise ValueError("Invalid config.yaml structure")
+            memory_config = config_data.get("memory")
+            if not isinstance(memory_config, dict):
+                memory_config = {}
+                config_data["memory"] = memory_config
+            if not has_native_writer:
+                provider_config = memory_config.get(name)
+                if not isinstance(provider_config, dict):
+                    provider_config = {}
+                provider_config.update(config_values)
+                memory_config[name] = provider_config
+            if activate:
+                memory_config["provider"] = name
+            updates[config_path] = serialize_yaml_bytes(config_data)
+
+        return updates
+
+    def _restore_runtime() -> None:
+        for env_key, previous in runtime_before.items():
+            if previous is runtime_missing:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = str(previous)
+
+    def _after_publish() -> None:
+        try:
+            for env_key, clean_value in runtime_updates.items():
+                os.environ[env_key] = clean_value
+            if secrets:
+                invalidate_env_cache()
+            if needs_config:
+                invalidate_config_caches(config_path)
+            if activate:
+                _require_memory_provider_ready(name)
+        except BaseException:
+            _restore_runtime()
+            if secrets:
+                invalidate_env_cache()
+            if needs_config:
+                invalidate_config_caches(config_path)
+            raise
+
+    try:
+        # Match save_config's global order: config cache lock first, then
+        # inter-process file locks. The callback reloads config before the
+        # transaction releases those file locks.
+        with _CONFIG_LOCK:
+            update_transaction(
+                targets,
+                _update,
+                home=home,
+                surface="web.memory-provider-config",
+                after_publish=_after_publish,
+                modes={env_path: 0o600} if secrets else None,
+            )
+    except BaseException:
+        for directory in reversed(created_dirs):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        if secrets:
+            invalidate_env_cache()
+        if needs_config:
+            invalidate_config_caches(config_path)
+        raise
 
 
 _MEMORY_PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -5294,33 +5528,104 @@ def _coerce_declared_field_value(field: DeclaredProviderField, raw: str) -> str:
 
 
 def _update_declared_provider_config(provider: DeclaredMemoryProvider, values: Dict[str, Any]) -> None:
-    existing = _read_declared_provider_file(provider)
-    json_values: Dict[str, Any] = {}
-    secrets: Dict[str, str] = {}
+    from hermes_cli import managed_scope
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        _set_env_bytes,
+        invalidate_env_cache,
+        is_managed,
+    )
+    from hermes_cli.config_store import update_transaction
 
+    if is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot update memory-provider configuration in managed mode"
+        )
+    json_values: Dict[str, str | None] = {}
+    secrets: Dict[str, str] = {}
     for field in provider.fields:
         if field.is_secret:
             submitted = str(values.get(field.key) or "").strip()
             if submitted and field.env_key:
                 secrets[field.env_key] = submitted
             continue
-
-        raw = (
-            values[field.key]
+        json_values[field.key] = (
+            _coerce_declared_field_value(field, str(values[field.key]))
             if field.key in values
-            else str(existing.get(field.key, field.default))
+            else None
         )
-        json_values[field.key] = _coerce_declared_field_value(field, str(raw))
 
-    path = _declared_provider_file_path(provider)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing.update(json_values)
-    from utils import atomic_json_write
+    if any(managed_scope.is_env_managed(key) for key in secrets):
+        raise ManagedConfigWriteError(
+            "Cannot update memory-provider secrets managed by an administrator"
+        )
 
-    atomic_json_write(path, existing, mode=0o600)
-
+    runtime_updates: Dict[str, str] = {}
     for env_key, secret in secrets.items():
-        save_env_value(env_key, secret)
+        _serialized, clean_value = _set_env_bytes(None, env_key, secret)
+        if "\x00" in clean_value:
+            raise ValueError("Invalid memory-provider environment value")
+        runtime_updates[env_key] = clean_value
+
+    home = get_hermes_home()
+    path = _declared_provider_file_path(provider)
+    created_dirs = _ensure_memory_provider_target_parents(home, [path])
+    env_path = home / ".env"
+
+    def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
+        native_raw = current[path]
+        if native_raw is None:
+            existing: Dict[str, Any] = {}
+        else:
+            parsed = json.loads(native_raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("Memory provider config must contain an object")
+            existing = parsed
+        for field in provider.fields:
+            if field.is_secret:
+                continue
+            submitted = json_values[field.key]
+            raw = (
+                submitted
+                if submitted is not None
+                else str(existing.get(field.key, field.default))
+            )
+            existing[field.key] = _coerce_declared_field_value(field, str(raw))
+
+        updates: Dict[Path, bytes] = {
+            path: (json.dumps(existing, indent=2) + "\n").encode("utf-8")
+        }
+        if secrets:
+            env_raw = current[env_path]
+            for env_key, secret in secrets.items():
+                env_raw, clean_value = _set_env_bytes(env_raw, env_key, secret)
+                if clean_value != runtime_updates[env_key]:
+                    raise RuntimeError(
+                        "Memory-provider environment value changed during transaction"
+                    )
+            assert env_raw is not None
+            updates[env_path] = env_raw
+        return updates
+
+    try:
+        update_transaction(
+            [path, env_path],
+            _update,
+            home=home,
+            modes={env_path: 0o600},
+        )
+    except BaseException:
+        for directory in reversed(created_dirs):
+            try:
+                directory.rmdir()
+            except OSError:
+                # Preserve any directory now used by a concurrent actor.
+                pass
+        raise
+    for env_key, secret in runtime_updates.items():
+        os.environ[env_key] = secret
+    if secrets:
+        invalidate_env_cache()
 
 
 @app.get("/api/memory/providers/{name}/config")
@@ -5357,10 +5662,14 @@ async def setup_memory_provider(name: str, body: MemoryProviderSetupRequest):
         try:
             _write_memory_provider_config_values(name, provider, body.values)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception:
-            _log.exception("Failed to persist memory provider setup values for %s", name)
-            raise HTTPException(status_code=500, detail="Internal server error")
+            _log_redacted_internal_error("memory-provider setup validation", exc)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid memory-provider configuration",
+            ) from exc
+        except Exception as exc:
+            _log_redacted_internal_error("memory-provider setup persistence", exc)
+            raise HTTPException(status_code=500, detail="Internal server error") from exc
     return _install_memory_provider_setup(name)
 
 
@@ -5376,10 +5685,14 @@ async def update_memory_provider_config(name: str, body: MemoryProviderConfigUpd
             _update_declared_provider_config(declared, body.values or {})
             return {"ok": True}
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception:
-            _log.exception("PUT /api/memory/providers/%s/config (declared) failed", name)
-            raise HTTPException(status_code=500, detail="Internal server error")
+            _log_redacted_internal_error("declared memory-provider validation", exc)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid memory-provider configuration",
+            ) from exc
+        except Exception as exc:
+            _log_redacted_internal_error("declared memory-provider persistence", exc)
+            raise HTTPException(status_code=500, detail="Internal server error") from exc
 
     provider = _load_memory_provider(name)
     if provider is None:
@@ -5388,25 +5701,19 @@ async def update_memory_provider_config(name: str, body: MemoryProviderConfigUpd
     values = body.values or {}
 
     try:
-        _write_memory_provider_config_values(name, provider, values)
-        _require_memory_provider_ready(name)
-
-        config = load_config()
-        memory_config = config.get("memory")
-        if not isinstance(memory_config, dict):
-            memory_config = {}
-            config["memory"] = memory_config
-        memory_config["provider"] = name
-        save_config(config)
-
+        _write_memory_provider_config_values(name, provider, values, activate=True)
         return {"ok": True, "active": name}
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception:
-        _log.exception("PUT /api/memory/providers/%s/config failed", name)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        _log_redacted_internal_error("memory-provider config validation", exc)
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid memory-provider configuration",
+        ) from exc
+    except Exception as exc:
+        _log_redacted_internal_error("memory-provider config persistence", exc)
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
 
 
 @app.get("/api/config")
@@ -6347,10 +6654,20 @@ async def get_env_vars(profile: Optional[str] = None):
 
 @app.put("/api/env")
 async def set_env_var(body: EnvVarUpdate, profile: Optional[str] = None):
+    if is_managed():
+        raise HTTPException(
+            status_code=403,
+            detail="Configuration is managed outside this dashboard",
+        )
     try:
         with _profile_scope(body.profile or profile):
             save_env_value(body.key, body.value)
         return {"ok": True, "key": body.key}
+    except ManagedConfigWriteError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Configuration is managed outside this dashboard",
+        ) from exc
     except ValueError as exc:
         # save_env_value raises ValueError for invalid names and for keys
         # on the denylist (LD_PRELOAD, PATH, PYTHONPATH, …). Surface the
@@ -13409,6 +13726,7 @@ async def create_profile_endpoint(body: ProfileCreate):
             clone_from=clone_from,
             clone_all=body.clone_all,
             clone_config=clone_config,
+            no_alias=True,
             no_skills=body.no_skills,
             description=body.description,
         )
@@ -13419,22 +13737,41 @@ async def create_profile_endpoint(body: ProfileCreate):
         # the opt-out marker and seed_profile_skills() will no-op.
         if not clone:
             profiles_mod.seed_profile_skills(path, quiet=True)
+    except (ValueError, FileExistsError, FileNotFoundError) as exc:
+        _log_redacted_internal_error("profile creation validation", exc)
+        raise HTTPException(status_code=400, detail="Invalid profile request") from exc
+    except Exception as exc:
+        _log_redacted_internal_error("profile creation", exc)
+        raise HTTPException(status_code=500, detail="Failed to create profile") from exc
 
-        # Match the CLI's profile-create flow: named profiles should get a
-        # wrapper in ~/.local/bin when the alias is safe to create.
-        collision = profiles_mod.check_alias_collision(body.name)
-        if not collision:
-            profiles_mod.create_wrapper_script(body.name)
-    except (ValueError, FileExistsError, FileNotFoundError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        _log.exception("POST /api/profiles failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    def _rollback_new_profile(context: str) -> None:
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            return
+        except Exception as cleanup_exc:
+            _log_redacted_internal_error(context, cleanup_exc)
+            # Keep a failed rollback out of the public profile namespace. A
+            # dot-prefixed quarantine is ignored by profile discovery and no
+            # wrapper has been published because create_profile used no_alias.
+            try:
+                import uuid
 
-    # Optional explicit model assignment for the new profile. Best-effort:
-    # the profile already exists, so a model-write hiccup must not 500 the
-    # whole create — the user can set the model later from the Models page
-    # or `<profile> setup`.
+                quarantine = path.with_name(
+                    f".{path.name}.failed-{os.getpid()}-{uuid.uuid4().hex}"
+                )
+                os.replace(path, quarantine)
+            except FileNotFoundError:
+                return
+            except Exception as quarantine_exc:
+                _log_redacted_internal_error(
+                    f"{context} quarantine",
+                    quarantine_exc,
+                )
+
+    # Optional explicit model assignment for the new profile. A requested
+    # assignment is part of the create operation: fail closed and remove the
+    # unpublished profile if persistence fails.
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
     model_set = False
@@ -13442,16 +13779,56 @@ async def create_profile_endpoint(body: ProfileCreate):
         try:
             _write_profile_model(path, provider, model)
             model_set = True
-        except Exception:
-            _log.exception("Setting model for new profile %s failed", body.name)
+        except Exception as exc:
+            _log_redacted_internal_error("new-profile model selection", exc)
+            _rollback_new_profile("new-profile rollback after model persistence failure")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to persist requested model",
+            ) from exc
 
-    # Optional MCP servers. Best-effort, same rationale as model assignment.
+    # Optional MCP servers. Persistence was explicitly requested by the caller:
+    # failing it must fail the create response instead of returning a profile
+    # that silently lacks the requested servers. Keep internal exception detail
+    # in the server log only.
     mcp_written = 0
     if body.mcp_servers:
         try:
             mcp_written = _write_profile_mcp_servers(path, body.mcp_servers)
-        except Exception:
-            _log.exception("Writing MCP servers for new profile %s failed", body.name)
+        except Exception as exc:
+            _log_redacted_internal_error("new-profile MCP persistence", exc)
+            _rollback_new_profile("new-profile rollback after MCP persistence failure")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to persist requested MCP servers",
+            ) from exc
+
+    # Publish the external wrapper only after every fail-closed create gate has
+    # succeeded.  The profile directory is removed above when requested MCP
+    # persistence fails, so a 500 response cannot leave a callable alias.
+    wrapper_attempted = False
+    try:
+        collision = profiles_mod.check_alias_collision(body.name)
+        if not collision:
+            wrapper_attempted = True
+            wrapper_path = profiles_mod.create_wrapper_script(body.name)
+            if wrapper_path is None:
+                raise OSError("profile wrapper publication failed")
+    except Exception as exc:
+        _log_redacted_internal_error("new-profile wrapper publication", exc)
+        if wrapper_attempted:
+            try:
+                profiles_mod.remove_wrapper_script(body.name)
+            except Exception as cleanup_exc:
+                _log_redacted_internal_error(
+                    "new-profile wrapper rollback",
+                    cleanup_exc,
+                )
+        _rollback_new_profile("new-profile rollback after wrapper publication failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to publish profile wrapper",
+        ) from exc
 
     # Optional "keep" skill selection — replace semantics. When the builder
     # sends an explicit keep list, disable every seeded skill not in it.
@@ -13460,8 +13837,8 @@ async def create_profile_endpoint(body: ProfileCreate):
     if body.keep_skills:
         try:
             skills_disabled = _disable_unselected_skills(path, body.keep_skills)
-        except Exception:
-            _log.exception("Applying skill selection for new profile %s failed", body.name)
+        except Exception as exc:
+            _log_redacted_internal_error("new-profile skill selection", exc)
 
     # Optional skills-hub installs. Spawned async, scoped to the new profile
     # via `-p <name>` (a fresh subprocess re-binds skills_hub.SKILLS_DIR to the
@@ -13477,12 +13854,8 @@ async def create_profile_endpoint(body: ProfileCreate):
                 _hub_action_name("install", ident),
             )
             hub_installs.append({"identifier": ident, "pid": proc.pid})
-        except Exception:
-            _log.exception(
-                "Spawning hub-skill install %s for new profile %s failed",
-                ident,
-                body.name,
-            )
+        except Exception as exc:
+            _log_redacted_internal_error("new-profile hub-skill spawn", exc)
             hub_installs.append({"identifier": ident, "pid": None})
 
     return {

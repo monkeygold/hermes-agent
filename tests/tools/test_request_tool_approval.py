@@ -77,16 +77,16 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
         monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "always")
-        persisted = {}
+        persisted = []
         monkeypatch.setattr(approval, "approve_session", lambda sk, pk: None)
-        monkeypatch.setattr(approval, "approve_permanent",
-                            lambda pk: persisted.setdefault("key", pk))
-        monkeypatch.setattr(approval, "save_permanent_allowlist",
-                            lambda x: persisted.setdefault("saved", True))
+        monkeypatch.setattr(
+            approval,
+            "approve_always",
+            lambda pattern_key, session_key=None: persisted.append(pattern_key),
+        )
         res = request_tool_approval("write_file", "reason", rule_key="ssh-writes")
         assert res["approved"] is True
-        assert persisted["key"] == "plugin_rule:ssh-writes"
-        assert persisted["saved"] is True
+        assert persisted == ["plugin_rule:ssh-writes"]
 
     def test_gateway_path_submits_pending_and_defers(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)

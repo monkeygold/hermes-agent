@@ -48,6 +48,82 @@ from utils import (
 
 logger = logging.getLogger("gateway.run")
 
+_MODEL_SWITCH_GENERIC_ERROR = (
+    "Model switch failed. Check gateway logs for details."
+)
+
+
+def _model_switch_generic_error() -> str:
+    """Return the stable, non-sensitive model-switch failure response."""
+    return t("gateway.model.error_prefix", error=_MODEL_SWITCH_GENERIC_ERROR)
+
+
+def _log_redacted_model_switch_error(
+    surface: str,
+    exc: Optional[BaseException] = None,
+    *,
+    level: int = logging.WARNING,
+) -> None:
+    """Log bounded model-switch diagnostics without values or tracebacks."""
+    failure_type = type(exc).__name__ if exc is not None else "ModelSwitchResult"
+    logger.log(
+        level,
+        "%s failed (%s): [REDACTED]",
+        surface,
+        failure_type,
+    )
+
+
+def _persist_gateway_model_selection(
+    config_path: Path,
+    *,
+    home: Path,
+    model: str,
+    provider: str,
+    base_url: str,
+) -> None:
+    """Merge one global model selection from a lock-protected disk snapshot."""
+    import yaml
+
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        invalidate_config_caches,
+        is_managed,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
+
+    if is_managed():
+        raise ManagedConfigWriteError("Cannot persist a model switch in managed mode")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _update(current: dict[Path, bytes | None]) -> dict[Path, bytes]:
+        raw = current[config_path]
+        cfg = yaml.safe_load(raw.decode("utf-8")) if raw is not None else {}
+        if cfg is None:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        raw_model = cfg.get("model")
+        if isinstance(raw_model, dict):
+            model_cfg = raw_model
+        elif isinstance(raw_model, str) and raw_model.strip():
+            model_cfg = {"default": raw_model.strip()}
+            cfg["model"] = model_cfg
+        else:
+            model_cfg = {}
+            cfg["model"] = model_cfg
+        model_cfg["default"] = model
+        model_cfg["provider"] = provider
+        if base_url:
+            model_cfg["base_url"] = base_url
+        if str(provider or "").strip().lower() != "custom":
+            clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+        return {config_path: serialize_yaml_bytes(cfg, sort_keys=False)}
+
+    update_transaction([config_path], _update, home=home)
+    invalidate_config_caches(config_path)
+
 # Upper bound on the off-loop agent-resource cleanup during a /new or /reset
 # (see _handle_reset_command). A stuck teardown must not block the event loop;
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
@@ -1583,20 +1659,27 @@ class GatewaySlashCommandsMixin:
                         # can fall through to a synchronous models.dev HTTP fetch
                         # (requests.get, 15s timeout) on a cold/expired cache,
                         # which freezes the gateway otherwise. See #20525, #41289.
-                        result = await asyncio.to_thread(
-                            _switch_model,
-                            raw_input=model_id,
-                            current_provider=_cur_provider,
-                            current_model=_cur_model,
-                            current_base_url=_cur_base_url,
-                            current_api_key=_cur_api_key,
-                            is_global=persist_global,
-                            explicit_provider=provider_slug,
-                            user_providers=user_provs,
-                            custom_providers=custom_provs,
-                        )
+                        try:
+                            result = await asyncio.to_thread(
+                                _switch_model,
+                                raw_input=model_id,
+                                current_provider=_cur_provider,
+                                current_model=_cur_model,
+                                current_base_url=_cur_base_url,
+                                current_api_key=_cur_api_key,
+                                is_global=persist_global,
+                                explicit_provider=provider_slug,
+                                user_providers=user_provs,
+                                custom_providers=custom_provs,
+                            )
+                        except Exception as exc:
+                            _log_redacted_model_switch_error("Picker model switch", exc)
+                            return _model_switch_generic_error()
                         if not result.success:
-                            return t("gateway.model.error_prefix", error=result.error_message)
+                            _log_redacted_model_switch_error(
+                                "Picker model switch result"
+                            )
+                            return _model_switch_generic_error()
 
                         try:
                             from hermes_cli.context_switch_guard import (
@@ -1612,7 +1695,11 @@ class GatewaySlashCommandsMixin:
                                 load_gateway_config=_load_gateway_config,
                             )
                         except Exception as exc:
-                            logger.debug("preflight-compression switch warning failed: %s", exc)
+                            _log_redacted_model_switch_error(
+                                "Picker model switch warning enrichment",
+                                exc,
+                                level=logging.DEBUG,
+                            )
 
                         # Update cached agent in-place
                         cached_entry = None
@@ -1621,7 +1708,25 @@ class GatewaySlashCommandsMixin:
                         if _cache_lock and _cache is not None:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
+                        rollback_agent_state = None
                         if cached_entry and cached_entry[0] is not None:
+                            rollback_agent_state = {
+                                "new_model": getattr(
+                                    cached_entry[0], "model", _cur_model
+                                ),
+                                "new_provider": getattr(
+                                    cached_entry[0], "provider", _cur_provider
+                                ),
+                                "api_key": getattr(
+                                    cached_entry[0], "api_key", _cur_api_key
+                                ),
+                                "base_url": getattr(
+                                    cached_entry[0], "base_url", _cur_base_url
+                                ),
+                                "api_mode": getattr(
+                                    cached_entry[0], "api_mode", None
+                                ),
+                            }
                             try:
                                 cached_entry[0].switch_model(
                                     new_model=result.new_model,
@@ -1640,16 +1745,39 @@ class GatewaySlashCommandsMixin:
                                 # the next message rebuilds a dead agent from the
                                 # broken override and the conversation is lost
                                 # (#50163).  A failed switch must be a no-op.
-                                logger.warning(
-                                    "Picker model switch failed for cached agent: %s", exc
+                                _log_redacted_model_switch_error(
+                                    "Picker cached-agent model switch", exc
                                 )
-                                return t(
-                                    "gateway.model.error_prefix",
-                                    error=(
-                                        f"Model switch to {result.new_model} failed ({exc}); "
-                                        f"staying on {_cur_model}."
-                                    ),
+                                return _model_switch_generic_error()
+
+                        if persist_global:
+                            try:
+                                _persist_gateway_model_selection(
+                                    config_path,
+                                    home=_picker_profile_home or _hermes_home,
+                                    model=result.new_model,
+                                    provider=result.target_provider,
+                                    base_url=result.base_url,
                                 )
+                            except Exception as exc:
+                                _log_redacted_model_switch_error(
+                                    "Picker model switch persistence", exc
+                                )
+                                if (
+                                    cached_entry
+                                    and cached_entry[0] is not None
+                                    and rollback_agent_state is not None
+                                ):
+                                    try:
+                                        cached_entry[0].switch_model(**rollback_agent_state)
+                                    except Exception as rollback_exc:
+                                        _log_redacted_model_switch_error(
+                                            "Picker cached-agent rollback",
+                                            rollback_exc,
+                                            level=logging.ERROR,
+                                        )
+                                        _self._evict_cached_agent(_session_key)
+                                return _model_switch_generic_error()
 
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
@@ -1663,8 +1791,10 @@ class GatewaySlashCommandsMixin:
                                     _sess_entry.session_id, result.new_model
                                 )
                             except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
+                                _log_redacted_model_switch_error(
+                                    "Picker model switch session DB persistence",
+                                    exc,
+                                    level=logging.DEBUG,
                                 )
 
                         # Store model note + session override
@@ -1691,46 +1821,17 @@ class GatewaySlashCommandsMixin:
                                 _session_key,
                                 _self._session_model_overrides[_session_key],
                             )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
+                        except Exception as exc:
+                            _log_redacted_model_switch_error(
+                                "Picker model switch session override persistence",
+                                exc,
+                                level=logging.DEBUG,
                             )
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
                         _self._evict_cached_agent(_session_key)
-
-                        # Persist to config (default) unless --session opted out,
-                        # mirroring the text /model command path above so a picked
-                        # model survives across sessions like a typed one (#49066).
-                        if persist_global:
-                            try:
-                                if config_path.exists():
-                                    with open(config_path, encoding="utf-8") as f:
-                                        _persist_cfg = yaml.safe_load(f) or {}
-                                else:
-                                    _persist_cfg = {}
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                if str(result.target_provider or "").strip().lower() != "custom":
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1840,21 +1941,26 @@ class GatewaySlashCommandsMixin:
         # through to a synchronous models.dev HTTP fetch (requests.get, 15s
         # timeout) on a cold/expired cache, which freezes the gateway
         # otherwise. See #20525, #41289.
-        result = await asyncio.to_thread(
-            _switch_model,
-            raw_input=model_input,
-            current_provider=current_provider,
-            current_model=current_model,
-            current_base_url=current_base_url,
-            current_api_key=current_api_key,
-            is_global=persist_global,
-            explicit_provider=explicit_provider,
-            user_providers=user_provs,
-            custom_providers=custom_provs,
-        )
+        try:
+            result = await asyncio.to_thread(
+                _switch_model,
+                raw_input=model_input,
+                current_provider=current_provider,
+                current_model=current_model,
+                current_base_url=current_base_url,
+                current_api_key=current_api_key,
+                is_global=persist_global,
+                explicit_provider=explicit_provider,
+                user_providers=user_provs,
+                custom_providers=custom_provs,
+            )
+        except Exception as exc:
+            _log_redacted_model_switch_error("Text model switch", exc)
+            return _model_switch_generic_error()
 
         if not result.success:
-            return t("gateway.model.error_prefix", error=result.error_message)
+            _log_redacted_model_switch_error("Text model switch result")
+            return _model_switch_generic_error()
 
         try:
             from hermes_cli.context_switch_guard import (
@@ -1870,7 +1976,11 @@ class GatewaySlashCommandsMixin:
                 load_gateway_config=_load_gateway_config,
             )
         except Exception as exc:
-            logger.debug("preflight-compression switch warning failed: %s", exc)
+            _log_redacted_model_switch_error(
+                "Text model switch warning enrichment",
+                exc,
+                level=logging.DEBUG,
+            )
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
@@ -1882,7 +1992,9 @@ class GatewaySlashCommandsMixin:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
 
+            rollback_api_mode = None
             if cached_entry and cached_entry[0] is not None:
+                rollback_api_mode = getattr(cached_entry[0], "api_mode", None)
                 try:
                     cached_entry[0].switch_model(
                         new_model=result.new_model,
@@ -1898,14 +2010,41 @@ class GatewaySlashCommandsMixin:
                     # write so a failed switch is a no-op rather than a dead
                     # conversation (#50163).  Without this early return the
                     # next message rebuilds a broken agent from the override.
-                    logger.warning("In-place model switch failed for cached agent: %s", exc)
-                    return t(
-                        "gateway.model.error_prefix",
-                        error=(
-                            f"Model switch to {result.new_model} failed ({exc}); "
-                            f"staying on {current_model}."
-                        ),
+                    _log_redacted_model_switch_error(
+                        "Text cached-agent model switch", exc
                     )
+                    return _model_switch_generic_error()
+
+            if persist_global:
+                try:
+                    _persist_gateway_model_selection(
+                        config_path,
+                        home=_command_profile_home or _hermes_home,
+                        model=result.new_model,
+                        provider=result.target_provider,
+                        base_url=result.base_url,
+                    )
+                except Exception as exc:
+                    _log_redacted_model_switch_error(
+                        "Text model switch persistence", exc
+                    )
+                    if cached_entry and cached_entry[0] is not None:
+                        try:
+                            cached_entry[0].switch_model(
+                                new_model=current_model,
+                                new_provider=current_provider,
+                                api_key=current_api_key,
+                                base_url=current_base_url,
+                                api_mode=rollback_api_mode,
+                            )
+                        except Exception as rollback_exc:
+                            _log_redacted_model_switch_error(
+                                "Text cached-agent rollback",
+                                rollback_exc,
+                                level=logging.ERROR,
+                            )
+                            self._evict_cached_agent(session_key)
+                    return _model_switch_generic_error()
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
@@ -1922,8 +2061,10 @@ class GatewaySlashCommandsMixin:
                         _sess_entry.session_id, result.new_model
                     )
                 except Exception as exc:
-                    logger.debug(
-                        "Failed to persist model switch to DB: %s", exc
+                    _log_redacted_model_switch_error(
+                        "Text model switch session DB persistence",
+                        exc,
+                        level=logging.DEBUG,
                     )
 
             # Store a note to prepend to the next user message so the model
@@ -1954,48 +2095,16 @@ class GatewaySlashCommandsMixin:
                     session_key,
                     self._session_model_overrides[session_key],
                 )
-            except Exception:
-                logger.debug(
-                    "Failed to persist session model override", exc_info=True
+            except Exception as exc:
+                _log_redacted_model_switch_error(
+                    "Text model switch session override persistence",
+                    exc,
+                    level=logging.DEBUG,
                 )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
-
-            # Persist to config (default) unless --session opted out
-            if persist_global:
-                try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    if str(result.target_provider or "").strip().lower() != "custom":
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
