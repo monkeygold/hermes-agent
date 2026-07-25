@@ -106,6 +106,10 @@ def test_declared_memory_provider_publishes_env_with_secret_mode(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     env_file = home / ".env"
+    native_config = home / "hindsight" / "config.json"
+    native_config.parent.mkdir()
+    native_config.write_text('{"mode":"local_external"}\n', encoding="utf-8")
+    os.chmod(native_config, 0o644)
     env_file.write_bytes(b"KEEP=old\n")
     os.chmod(env_file, 0o644)
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -121,6 +125,93 @@ def test_declared_memory_provider_publishes_env_with_secret_mode(
 
     assert b"HINDSIGHT_API_KEY=test-secret" in env_file.read_bytes()
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(native_config.stat().st_mode) == 0o600
+
+
+def test_declared_memory_provider_runtime_reload_failure_rolls_back_files_and_env(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    provider_dir = home / "hindsight"
+    provider_dir.mkdir(parents=True)
+    native_config = provider_dir / "config.json"
+    native_before = b'{"mode":"local_external"}\n'
+    native_config.write_bytes(native_before)
+    os.chmod(native_config, 0o600)
+    env_file = home / ".env"
+    env_before = b"HINDSIGHT_API_KEY=before-secret\n"
+    env_file.write_bytes(env_before)
+    os.chmod(env_file, 0o600)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "before-secret")
+
+    import hermes_cli.env_loader as env_loader
+    import hermes_cli.web_server as web_server
+    from hermes_cli.memory_providers import HINDSIGHT
+
+    def fail_reload(**_kwargs):
+        raise RuntimeError("injected runtime reload failure")
+
+    monkeypatch.setattr(env_loader, "load_hermes_dotenv", fail_reload)
+
+    with pytest.raises(RuntimeError, match="runtime reload failure"):
+        web_server._update_declared_provider_config(
+            HINDSIGHT,
+            {"mode": "cloud", "api_key": "after-secret"},
+        )
+
+    assert native_config.read_bytes() == native_before
+    assert env_file.read_bytes() == env_before
+    assert os.environ["HINDSIGHT_API_KEY"] == "before-secret"
+
+
+def test_declared_memory_provider_finalize_failure_restores_runtime(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    provider_dir = home / "hindsight"
+    provider_dir.mkdir(parents=True)
+    native_config = provider_dir / "config.json"
+    native_before = b'{"mode":"local_external"}\n'
+    native_config.write_bytes(native_before)
+    os.chmod(native_config, 0o600)
+    env_file = home / ".env"
+    env_before = b"HINDSIGHT_API_KEY=before-secret\n"
+    env_file.write_bytes(env_before)
+    os.chmod(env_file, 0o600)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "before-secret")
+
+    import hermes_cli.config_store as config_store
+    import hermes_cli.web_server as web_server
+    from hermes_cli.config_store import ConfigTransactionError
+    from hermes_cli.memory_providers import HINDSIGHT
+
+    real_remove_journal = config_store._remove_transaction_journal
+    remove_calls = 0
+
+    def fail_first_journal_removal(journal):
+        nonlocal remove_calls
+        remove_calls += 1
+        if remove_calls == 1:
+            raise OSError("injected journal finalization failure")
+        return real_remove_journal(journal)
+
+    monkeypatch.setattr(
+        config_store,
+        "_remove_transaction_journal",
+        fail_first_journal_removal,
+    )
+
+    with pytest.raises(ConfigTransactionError, match="journal finalization failure"):
+        web_server._update_declared_provider_config(
+            HINDSIGHT,
+            {"mode": "cloud", "api_key": "after-secret"},
+        )
+
+    assert native_config.read_bytes() == native_before
+    assert env_file.read_bytes() == env_before
+    assert os.environ["HINDSIGHT_API_KEY"] == "before-secret"
 
 
 def test_declared_memory_provider_removes_new_parent_when_transaction_fails(

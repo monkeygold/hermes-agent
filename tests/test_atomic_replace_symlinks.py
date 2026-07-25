@@ -416,6 +416,38 @@ def test_atomic_replace_rolls_back_regular_target_when_directory_fsync_fails(
     assert tmp.read_text(encoding="utf-8") == "new\n"
 
 
+def test_atomic_replace_rolls_back_identical_bytes_when_directory_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "config.yaml"
+    target.write_text("same\n", encoding="utf-8")
+    original_stat = target.stat()
+    tmp = _write_tmp(tmp_path, "same\n")
+    os.chmod(tmp, 0o600)
+
+    from utils import _fsync_directory as real_fsync_directory
+
+    calls = 0
+
+    def fail_first_directory_fsync(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "injected identical-byte fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr("utils._fsync_directory", fail_first_directory_fsync)
+
+    with pytest.raises(OSError, match="identical-byte fsync failure"):
+        atomic_replace(tmp, target)
+
+    restored_stat = target.stat()
+    assert target.read_text(encoding="utf-8") == "same\n"
+    assert restored_stat.st_ino == original_stat.st_ino
+    assert tmp.read_text(encoding="utf-8") == "same\n"
+    assert stat.S_IMODE(tmp.stat().st_mode) == 0o600
+
+
 def test_atomic_replace_real_cross_device(tmp_path: Path) -> None:
     shm = Path("/dev/shm")
     if os.name != "posix" or not os.access(shm, os.W_OK):

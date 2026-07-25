@@ -5571,6 +5571,26 @@ def _update_declared_provider_config(provider: DeclaredMemoryProvider, values: D
     path = _declared_provider_file_path(provider)
     created_dirs = _ensure_memory_provider_target_parents(home, [path])
     env_path = home / ".env"
+    runtime_before = dict(os.environ)
+
+    def _restore_runtime() -> None:
+        os.environ.clear()
+        os.environ.update(runtime_before)
+        invalidate_env_cache()
+
+    def _commit_runtime() -> None:
+        if not secrets:
+            return
+        try:
+            for env_key, secret in runtime_updates.items():
+                os.environ[env_key] = secret
+            invalidate_env_cache()
+            from hermes_cli.env_loader import load_hermes_dotenv
+
+            load_hermes_dotenv(hermes_home=home)
+        except BaseException:
+            _restore_runtime()
+            raise
 
     def _update(current: Dict[Path, bytes | None]) -> Dict[Path, bytes]:
         native_raw = current[path]
@@ -5612,9 +5632,12 @@ def _update_declared_provider_config(provider: DeclaredMemoryProvider, values: D
             [path, env_path],
             _update,
             home=home,
-            modes={env_path: 0o600},
+            modes={path: 0o600, env_path: 0o600},
+            after_publish=_commit_runtime,
         )
     except BaseException:
+        if secrets:
+            _restore_runtime()
         for directory in reversed(created_dirs):
             try:
                 directory.rmdir()
@@ -5622,10 +5645,6 @@ def _update_declared_provider_config(provider: DeclaredMemoryProvider, values: D
                 # Preserve any directory now used by a concurrent actor.
                 pass
         raise
-    for env_key, secret in runtime_updates.items():
-        os.environ[env_key] = secret
-    if secrets:
-        invalidate_env_cache()
 
 
 @app.get("/api/memory/providers/{name}/config")

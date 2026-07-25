@@ -424,6 +424,50 @@ def test_config_read_recovers_journal_after_process_crash_mid_transaction(
     assert not list((home / ".config-locks").glob("transaction-*.json"))
 
 
+@pytest.mark.parametrize("loader_kind", ["parsed", "dotenv"])
+def test_env_readers_recover_journal_before_consuming_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loader_kind: str,
+) -> None:
+    home = tmp_path / loader_kind
+    home.mkdir()
+    config = home / "config.yaml"
+    env = home / ".env"
+    config_before = b"model:\n  default: before/model\n"
+    env_before = b"TOKEN=before\n"
+    config.write_bytes(config_before)
+    env.write_bytes(env_before)
+
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(
+        target=_crash_after_first_transaction_publish,
+        args=(str(home),),
+    )
+    process.start()
+    process.join(timeout=20)
+    assert process.exitcode == 86
+    assert config.read_bytes() == b"model:\n  default: after/model\n"
+    assert list((home / ".config-locks").glob("transaction-*.json"))
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    if loader_kind == "parsed":
+        from hermes_cli.config import invalidate_env_cache, load_env
+
+        invalidate_env_cache()
+        assert load_env()["TOKEN"] == "before"
+    else:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        monkeypatch.delenv("TOKEN", raising=False)
+        load_hermes_dotenv(hermes_home=home)
+        assert os.environ["TOKEN"] == "before"
+
+    assert config.read_bytes() == config_before
+    assert env.read_bytes() == env_before
+    assert not list((home / ".config-locks").glob("transaction-*.json"))
+
+
 def test_config_read_does_not_deadlock_with_transaction_after_publish_callback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

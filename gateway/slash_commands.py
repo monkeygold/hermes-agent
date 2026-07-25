@@ -1992,11 +1992,18 @@ class GatewaySlashCommandsMixin:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
 
-            rollback_api_mode = None
-            if cached_entry and cached_entry[0] is not None:
-                rollback_api_mode = getattr(cached_entry[0], "api_mode", None)
+            cached_agent = cached_entry[0] if cached_entry else None
+            cached_snapshot = None
+            if cached_agent is not None:
+                cached_snapshot = {
+                    "new_model": getattr(cached_agent, "model", current_model),
+                    "new_provider": getattr(cached_agent, "provider", current_provider),
+                    "api_key": getattr(cached_agent, "api_key", current_api_key),
+                    "base_url": getattr(cached_agent, "base_url", current_base_url),
+                    "api_mode": getattr(cached_agent, "api_mode", None),
+                }
                 try:
-                    cached_entry[0].switch_model(
+                    cached_agent.switch_model(
                         new_model=result.new_model,
                         new_provider=result.target_provider,
                         api_key=result.api_key,
@@ -2028,15 +2035,13 @@ class GatewaySlashCommandsMixin:
                     _log_redacted_model_switch_error(
                         "Text model switch persistence", exc
                     )
-                    if cached_entry and cached_entry[0] is not None:
+                    if cached_agent is not None and cached_snapshot is not None:
                         try:
-                            cached_entry[0].switch_model(
-                                new_model=current_model,
-                                new_provider=current_provider,
-                                api_key=current_api_key,
-                                base_url=current_base_url,
-                                api_mode=rollback_api_mode,
-                            )
+                            # switch_model treats an empty api_key as "keep the
+                            # current key". Restore it first so the rebuilt
+                            # client cannot retain the failed provider's secret.
+                            cached_agent.api_key = cached_snapshot["api_key"]
+                            cached_agent.switch_model(**cached_snapshot)
                         except Exception as rollback_exc:
                             _log_redacted_model_switch_error(
                                 "Text cached-agent rollback",

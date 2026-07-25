@@ -37,21 +37,33 @@ def test_helper_propagates_contextvar_and_approval_callback():
         "cluster_probe", default="unset"
     )
     probe.set("parent-value")
-    sentinel = object()
+    sentinel_result = object()
+    calls: list[tuple[tuple, dict]] = []
+
+    def sentinel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel_result
+
     TT.set_approval_callback(sentinel)
     try:
         seen: dict = {}
 
         def worker():
             seen["probe"] = probe.get()
-            seen["cb"] = TT._get_approval_callback()
+            callback = TT._get_approval_callback()
+            assert callback is not None
+            seen["cb"] = callback
+            seen["result"] = callback("printf ok", "test approval")
 
         t = threading.Thread(target=propagate_context_to_thread(worker))
         t.start()
         t.join(timeout=5)
 
         assert seen["probe"] == "parent-value"  # ContextVar propagated
-        assert seen["cb"] is sentinel            # thread-local callback propagated
+        assert seen["result"] is sentinel_result
+        assert len(calls) == 1
+        assert calls[0][0] == ("printf ok", "test approval")
+        assert calls[0][1] in ({}, {"allow_permanent": True})
     finally:
         TT.set_approval_callback(None)
 
@@ -61,13 +73,20 @@ def test_helper_clears_callbacks_on_teardown():
     the wrapped target finishes (mirrors the GHSA-qg5c-hvr5-hjgr teardown)."""
     from tools import terminal_tool as TT
 
-    sentinel = object()
+    sentinel_result = object()
+
+    def sentinel(*_args, **_kwargs):
+        return sentinel_result
+
     TT.set_approval_callback(sentinel)
     try:
         seen: dict = {}
 
         def first():
-            seen["during"] = TT._get_approval_callback()
+            callback = TT._get_approval_callback()
+            assert callback is not None
+            seen["during"] = callback
+            seen["result"] = callback("printf ok", "test approval")
 
         def second():  # NOT wrapped — runs on the same recycled worker thread
             seen["after"] = TT._get_approval_callback()
@@ -76,7 +95,7 @@ def test_helper_clears_callbacks_on_teardown():
             ex.submit(propagate_context_to_thread(first)).result(timeout=5)
             ex.submit(second).result(timeout=5)
 
-        assert seen["during"] is sentinel  # installed for the wrapped target
+        assert seen["result"] is sentinel_result
         assert seen["after"] is None       # cleared on teardown
     finally:
         TT.set_approval_callback(None)

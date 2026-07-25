@@ -7599,6 +7599,9 @@ def load_env() -> Dict[str, str]:
     """
     global _env_cache
     env_path = get_env_path()
+    from hermes_cli.config_store import recover_incomplete_transactions
+
+    recover_incomplete_transactions(env_path.parent)
 
     try:
         mtime = env_path.stat().st_mtime

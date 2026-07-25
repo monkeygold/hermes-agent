@@ -2210,9 +2210,12 @@ def approve_permanent(pattern_key: str):
 
 def load_permanent(patterns: set):
     """Replace the in-process permanent allowlist with *patterns*."""
+    global _last_allowlist_config_signature
+    _disk_patterns, signature = _read_allowlist_config_snapshot()
     with _lock:
         _permanent_approved.clear()
         _permanent_approved.update(_coerce_allowlist_patterns(patterns))
+        _last_allowlist_config_signature = signature
 
 
 _ALLOWLIST_SHELL_OPERATOR_RE = re.compile(r"(?:\n|&&|\|\||[;&|<>`]|\$\()")
@@ -2281,15 +2284,17 @@ def _coerce_allowlist_patterns(raw) -> set[str]:
 
 
 def _read_allowlist_config_snapshot():
-    """Read allowlist bytes and signature from one stable file descriptor."""
-    try:
-        from hermes_constants import get_hermes_home
+    """Read user + managed allowlists with content-bound signatures."""
+    from hermes_constants import get_hermes_home
 
-        path = Path(get_hermes_home()) / "config.yaml"
-        with path.open("rb") as handle:
-            stat = os.fstat(handle.fileno())
-            raw = handle.read()
-        signature = (
+    def _read_file(path: Path):
+        try:
+            with path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                raw = handle.read()
+        except OSError:
+            return None, (str(path), None)
+        return raw, (
             str(path),
             stat.st_dev,
             stat.st_ino,
@@ -2297,16 +2302,45 @@ def _read_allowlist_config_snapshot():
             stat.st_size,
             hashlib.sha256(raw).digest(),
         )
+
+    user_path = Path(get_hermes_home()) / "config.yaml"
+    user_raw, user_signature = _read_file(user_path)
+    patterns: set[str] = set()
+    if user_raw is not None:
         try:
-            parsed = yaml.safe_load(raw.decode("utf-8"))
+            parsed = yaml.safe_load(user_raw.decode("utf-8"))
             patterns = _coerce_allowlist_patterns(
                 parsed.get("command_allowlist") if isinstance(parsed, dict) else None
             )
         except (UnicodeDecodeError, yaml.YAMLError):
             patterns = set()
-        return patterns, signature
-    except OSError:
-        return set(), None
+
+    managed_raw = None
+    managed_signature = None
+    try:
+        from hermes_cli.managed_scope import get_managed_dir
+
+        managed_dir = get_managed_dir()
+        if managed_dir is not None:
+            managed_raw, managed_signature = _read_file(managed_dir / "config.yaml")
+    except Exception as exc:  # noqa: BLE001 — managed scope is fail-open
+        logger.warning(
+            "Failed to resolve managed allowlist config (%s)",
+            type(exc).__name__,
+        )
+
+    if managed_raw is not None:
+        try:
+            managed = yaml.safe_load(managed_raw.decode("utf-8"))
+            if isinstance(managed, dict) and "command_allowlist" in managed:
+                patterns = _coerce_allowlist_patterns(managed["command_allowlist"])
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            logger.warning(
+                "Failed to parse managed allowlist config (%s)",
+                type(exc).__name__,
+            )
+
+    return patterns, (user_signature, managed_signature)
 
 
 def _allowlist_config_signature():

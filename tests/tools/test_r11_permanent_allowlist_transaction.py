@@ -114,6 +114,44 @@ def test_hot_process_revokes_same_inode_size_and_mtime(
     assert approval.is_approved("session", "terminal:bravo") is True
 
 
+def test_hot_process_revokes_managed_allowlist_same_inode_size_and_mtime(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    home.mkdir(mode=0o700)
+    managed.mkdir(mode=0o700)
+    (home / "config.yaml").write_text("command_allowlist: []\n", encoding="utf-8")
+    managed_config = managed / "config.yaml"
+    before = "command_allowlist:\n  - terminal:alpha\n"
+    after = "command_allowlist:\n  - terminal:bravo\n"
+    assert len(before) == len(after)
+    managed_config.write_text(before, encoding="utf-8")
+    original_stat = managed_config.stat()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+    import hermes_cli.managed_scope as managed_scope
+    import tools.approval as approval
+
+    managed_scope.invalidate_managed_cache()
+    approval.load_permanent_allowlist()
+    assert approval.is_approved("session", "terminal:alpha") is True
+
+    managed_config.write_text(after, encoding="utf-8")
+    os.utime(
+        managed_config,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    current_stat = managed_config.stat()
+    assert current_stat.st_ino == original_stat.st_ino
+    assert current_stat.st_size == original_stat.st_size
+    assert current_stat.st_mtime_ns == original_stat.st_mtime_ns
+
+    assert approval.is_approved("session", "terminal:alpha") is False
+    assert approval.is_approved("session", "terminal:bravo") is True
+
+
 def test_permanent_allowlist_persistence_error_logs_only_exception_class(
     monkeypatch, caplog,
 ) -> None:

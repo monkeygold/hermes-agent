@@ -1147,6 +1147,7 @@ class TestLoginNousSkipKeepsCurrent:
         instead of leaving it as nous."""
         import argparse
         import yaml
+        import hermes_cli.auth as auth_module
         from hermes_cli.auth import PROVIDER_REGISTRY, _login_nous
 
         hermes_home = tmp_path / "hermes"
@@ -1156,7 +1157,21 @@ class TestLoginNousSkipKeepsCurrent:
         config_path = hermes_home / "config.yaml"
         config_path.write_text(yaml.safe_dump({"model": {}}, sort_keys=False))
 
-        # No auth.json yet — simulates first-run before any OAuth
+        # No auth.json yet — simulates first-run before any OAuth.
+        # Record every post-publish activation: a final JSON reset is insufficient
+        # if the process briefly switches to Nous before the user chooses a model.
+        observed_active_providers = []
+        real_save_auth_store = auth_module._save_auth_store
+
+        def record_runtime_activation(auth_store):
+            observed_active_providers.append(auth_store.get("active_provider"))
+            return real_save_auth_store(auth_store)
+
+        monkeypatch.setattr(
+            auth_module,
+            "_save_auth_store",
+            record_runtime_activation,
+        )
         self._patch_login_internals(monkeypatch, prompt_returns=None)
 
         args = argparse.Namespace(
@@ -1169,8 +1184,9 @@ class TestLoginNousSkipKeepsCurrent:
         auth_after = json.loads(auth_path.read_text())
         # active_provider should NOT be set to "nous" after Skip
         assert auth_after.get("active_provider") in {None, ""}
-        # But Nous creds are still saved
+        # But Nous creds are still saved without ever activating Nous at runtime.
         assert "nous" in auth_after.get("providers", {})
+        assert "nous" not in observed_active_providers
 
 
 # =============================================================================

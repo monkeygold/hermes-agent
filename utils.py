@@ -140,9 +140,14 @@ def atomic_replace(
     except FileNotFoundError:
         original_lstat = None
     source_path_obj = Path(tmp_str)
+    source_lstat = os.lstat(source_path_obj)
+    if not stat.S_ISREG(source_lstat.st_mode):
+        raise ValueError(f"Atomic replace source must be a regular file: {source_path_obj}")
     source_bytes = source_path_obj.read_bytes()
     if mode is not None:
         os.chmod(tmp_str, mode)
+    source_stat = os.stat(source_path_obj, follow_symlinks=False)
+    source_mode = stat.S_IMODE(source_stat.st_mode)
 
     def verify_symlink() -> None:
         if not symlink:
@@ -187,6 +192,34 @@ def atomic_replace(
     verify_symlink()
     verify_regular_target()
     fallback_tmp: str | None = None
+    original_backup: str | None = None
+    if original_lstat is not None:
+        backup_fd, backup_slot = tempfile.mkstemp(
+            dir=str(real_path_obj.parent),
+            prefix=f".{real_path_obj.name}.",
+            suffix=".rollback.link",
+        )
+        os.close(backup_fd)
+        os.unlink(backup_slot)
+        try:
+            os.link(real_path, backup_slot, follow_symlinks=False)
+            backup_stat = os.lstat(backup_slot)
+            if (backup_stat.st_dev, backup_stat.st_ino) != (
+                original_lstat.st_dev,
+                original_lstat.st_ino,
+            ):
+                from hermes_cli.config_store import UnsafeConfigPathError
+
+                raise UnsafeConfigPathError(
+                    f"Configuration target changed while creating rollback backup: {target_str}"
+                )
+            original_backup = backup_slot
+        except BaseException:
+            try:
+                os.unlink(backup_slot)
+            except OSError:
+                pass
+            raise
     replaced = False
     try:
         verify_regular_target()
@@ -233,12 +266,15 @@ def atomic_replace(
         if replaced:
             rollback_tmp: str | None = None
             try:
-                if original_bytes is None:
+                if original_backup is not None:
+                    os.replace(original_backup, real_path)
+                    original_backup = None
+                elif original_bytes is None:
                     try:
                         real_path_obj.unlink()
                     except FileNotFoundError:
                         pass
-                elif not real_path_obj.is_file() or real_path_obj.read_bytes() != original_bytes:
+                else:
                     fd, rollback_tmp = tempfile.mkstemp(
                         dir=str(real_path_obj.parent),
                         prefix=f".{real_path_obj.name}.",
@@ -261,11 +297,43 @@ def atomic_replace(
                         os.unlink(rollback_tmp)
                     except OSError:
                         pass
-        if not source_path_obj.exists():
+        if not os.path.lexists(source_path_obj):
+            source_fd = -1
+            source_created = False
             try:
-                source_path_obj.write_bytes(source_bytes)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                source_fd = os.open(source_path_obj, flags, source_mode)
+                source_created = True
+                if (
+                    os.name == "posix"
+                    and hasattr(os, "geteuid")
+                    and hasattr(os, "fchown")
+                    and os.geteuid() == 0
+                ):
+                    os.fchown(source_fd, source_stat.st_uid, source_stat.st_gid)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(source_fd, source_mode)
+                remaining = memoryview(source_bytes)
+                while remaining:
+                    written = os.write(source_fd, remaining)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short write while restoring source")
+                    remaining = remaining[written:]
+                os.fsync(source_fd)
             except OSError:
-                pass
+                if source_created:
+                    try:
+                        os.unlink(source_path_obj)
+                    except OSError:
+                        pass
+            finally:
+                if source_fd >= 0:
+                    try:
+                        os.close(source_fd)
+                    except OSError:
+                        pass
         # The caller owns the source temp file; preserve it on failure so a
         # transaction can diagnose/rollback and EBUSY is visibly fail-closed.
         if rollback_error is not None:
@@ -273,6 +341,12 @@ def atomic_replace(
                 f"atomic replacement failed and rollback failed: {rollback_error}"
             ) from exc
         raise
+    finally:
+        if original_backup is not None:
+            try:
+                os.unlink(original_backup)
+            except OSError:
+                pass
     return real_path
 
 

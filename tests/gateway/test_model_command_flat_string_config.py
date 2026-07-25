@@ -11,6 +11,7 @@ before mutation, so ``--global`` succeeds and the config is rewritten in
 the proper ``model: {default: ..., provider: ...}`` form.
 """
 
+import threading
 import types
 
 import yaml
@@ -288,3 +289,64 @@ async def test_model_text_persistence_exception_has_no_global_confirmation(
     assert secret not in rendered_logs
     assert "ConfigTransactionError" in rendered_logs
     assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_model_text_persistence_failure_restores_complete_cached_agent_state(
+    tmp_path, monkeypatch,
+):
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    runner = _make_runner()
+    monkeypatch.setattr(runner, "_agent_cache_lock", threading.Lock(), raising=False)
+    monkeypatch.setattr(runner, "_agent_cache", {}, raising=False)
+    event = _make_event("/model gpt-5.5 --global")
+    calls = []
+
+    class CachedAgent:
+        model = "runtime-model"
+        provider = "runtime-provider"
+        api_key = ""
+        base_url = "https://runtime.invalid/v1"
+        api_mode = "runtime-mode"
+        _client_kwargs = {"api_key": "", "base_url": base_url}
+
+        def switch_model(self, **kwargs):
+            calls.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            if kwargs["api_key"]:
+                self.api_key = kwargs["api_key"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+            self._client_kwargs = {
+                "api_key": kwargs["api_key"] or self.api_key,
+                "base_url": kwargs["base_url"] or self.base_url,
+            }
+
+    session_key = runner._session_key_for_source(event.source)
+    cached_agent = CachedAgent()
+    runner._agent_cache[session_key] = (cached_agent, 0, None)
+
+    def fail_persist(*_args, **_kwargs):
+        raise OSError("injected text persistence failure")
+
+    monkeypatch.setattr("hermes_cli.config_store.atomic_replace", fail_persist)
+
+    reply = await runner._handle_model_command(event)
+
+    assert reply is not None
+    assert "model switch failed" in reply.lower()
+    assert calls[-1] == {
+        "new_model": "runtime-model",
+        "new_provider": "runtime-provider",
+        "api_key": "",
+        "base_url": "https://runtime.invalid/v1",
+        "api_mode": "runtime-mode",
+    }
+    assert calls[0]["api_key"] == "sk-test"
+    assert cached_agent.api_key == ""
+    assert cached_agent._client_kwargs["api_key"] == ""

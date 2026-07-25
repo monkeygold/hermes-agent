@@ -233,6 +233,9 @@ def load_hermes_dotenv(
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    from hermes_cli.config_store import recover_incomplete_transactions
+
+    recover_incomplete_transactions(home_path)
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
