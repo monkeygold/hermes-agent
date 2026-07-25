@@ -1133,6 +1133,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - env_type and backend resource/mount keys -- trusted infrastructure
+          may create a fully isolated per-task environment
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1225,6 +1227,59 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
         or _task_env_overrides.get(_resolve_container_task_id(raw))
         or {}
     )
+
+
+# Per-task infrastructure may switch the backend and tighten its resource /
+# mount policy without changing the process-wide terminal configuration.  CWD
+# remains resolved separately at each call site because session cwd records and
+# the container host-path sanitizer have their own precedence rules.
+_TASK_ENV_CONFIG_OVERRIDE_KEYS = frozenset({
+    "env_type",
+    "modal_mode",
+    "docker_image",
+    "singularity_image",
+    "modal_image",
+    "daytona_image",
+    "host_cwd",
+    "docker_mount_cwd_to_workspace",
+    "timeout",
+    "lifetime_seconds",
+    "container_cpu",
+    "container_memory",
+    "container_disk",
+    "container_persistent",
+    "docker_volumes",
+    "docker_forward_env",
+    "docker_env",
+    "docker_run_as_host_user",
+    "docker_network",
+    "docker_extra_args",
+    "docker_persist_across_processes",
+    "docker_orphan_reaper",
+    "docker_mount_host_resources",
+    "ssh_host",
+    "ssh_user",
+    "ssh_port",
+    "ssh_key",
+    "ssh_persistent",
+    "local_persistent",
+})
+
+
+def resolve_task_env_config(task_id: Optional[str]) -> Dict[str, Any]:
+    """Return global terminal config with trusted per-task overrides applied.
+
+    This is infrastructure-only state registered before an agent loop starts;
+    it is never model supplied.  Keeping the merge here ensures terminal and
+    file tools select the same backend.  ``cwd`` is intentionally excluded and
+    continues to use each caller's session-aware sanitization path.
+    """
+    config = _get_env_config()
+    overrides = resolve_task_overrides(task_id)
+    for key in _TASK_ENV_CONFIG_OVERRIDE_KEYS:
+        if key in overrides:
+            config[key] = overrides[key]
+    return config
 
 
 # Configuration from environment variables
@@ -1469,6 +1524,10 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_orphan_reaper": os.getenv(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
+        # Host credentials, skill directories, and media caches are useful in
+        # the normal shared sandbox, but infrastructure-created restricted
+        # sandboxes can disable every such auxiliary bind mount per task.
+        "docker_mount_host_resources": True,
     }
 
 
@@ -1538,6 +1597,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            mount_host_resources=cc.get("docker_mount_host_resources", True),
         )
     
     elif env_type == "singularity":
@@ -2154,7 +2214,7 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         # Get configuration
-        config = _get_env_config()
+        config = resolve_task_env_config(task_id)
         env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
@@ -2305,6 +2365,7 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "docker_mount_host_resources": config.get("docker_mount_host_resources", True),
                             }
 
                         local_config = None
@@ -2445,13 +2506,15 @@ def terminal_tool(
                 "EOF."
             )
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
+        # Keep the originating gateway session key for approval/process routing,
+        # but scope cwd state to the concrete tool task.  Delegated workers
+        # intentionally inherit the parent's approval context; using that parent
+        # key for cwd resolution would inject the host checkout path into a child
+        # whose sandbox-local cwd is /workspace.
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        cwd_session_key = task_id or session_key
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2462,7 +2525,7 @@ def terminal_tool(
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
-                session_key=session_key,
+                session_key=cwd_session_key,
             )
             try:
                 if env_type == "local":
@@ -2722,7 +2785,7 @@ def terminal_tool(
                     command_cwd = _resolve_command_cwd(
                         workdir=workdir,
                         default_cwd=cwd,
-                        session_key=session_key,
+                        session_key=cwd_session_key,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,
@@ -2770,7 +2833,7 @@ def terminal_tool(
             # session — record it under the session key so the durable record
             # never depends on the shared env surviving or on who drives the
             # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            record_session_cwd(cwd_session_key, getattr(env, "cwd", None))
 
             # Extract output
             output = result.get("output", "")

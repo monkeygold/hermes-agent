@@ -83,9 +83,9 @@ Architecture:
     Task that opened the connection (required by anyio).
 
 Thread safety:
-    _servers and _mcp_loop/_mcp_thread are accessed from both the MCP
-    background thread and caller threads.  All mutations are protected by
-    _lock so the code is safe regardless of GIL presence (e.g. Python 3.13+
+    _servers/_pending_servers and _mcp_loop/_mcp_thread are accessed from both
+    the MCP background thread and caller threads.  All mutations are protected
+    by _lock so the code is safe regardless of GIL presence (e.g. Python 3.13+
     free-threading).
 """
 
@@ -1737,7 +1737,7 @@ class MCPServerTask:
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
-        "_reconnect_retries",
+        "_reconnect_retries", "_parked_initial_failure",
     )
 
     def __init__(self, name: str):
@@ -1760,6 +1760,10 @@ class MCPServerTask:
         self._elicitation: Optional[ElicitationHandler] = None
         self._registered_tool_names: list[str] = []
         self._reconnect_retries: int = 0
+        # True after an initial-connect failure parks and start() reports the
+        # error to discovery.  It remains true through revival probes until the
+        # server is promoted into _servers (or its run task terminates).
+        self._parked_initial_failure: bool = False
         self._auth_type: str = ""
         self._refresh_lock = asyncio.Lock()
         # MCP stdio sessions are a single JSON-RPC stream. Some servers emit
@@ -2806,7 +2810,29 @@ class MCPServerTask:
         revival must publish the freshly discovered tools again — otherwise
         the transport comes back alive with zero registered tools.
         """
-        if not self._ready.is_set() or self._registered_tool_names:
+        # A server reviving from an *initial* parked failure has never reached
+        # _discover_and_register_server(), so _ready is still clear while its
+        # freshly established transport calls this method.  Promote that exact
+        # pending instance before publishing tools.  Moving it under _lock also
+        # makes a concurrent global shutdown see and await it.
+        promoted_initial_server = False
+        with _lock:
+            if (
+                _pending_servers.get(self.name) is self
+                and self._parked_initial_failure
+                and not self._shutdown_event.is_set()
+            ):
+                _pending_servers.pop(self.name, None)
+                _servers[self.name] = self
+                _server_connecting.discard(self.name)
+                _server_connect_errors.pop(self.name, None)
+                self._parked_initial_failure = False
+                promoted_initial_server = True
+
+        if (
+            (not self._ready.is_set() and not promoted_initial_server)
+            or self._registered_tool_names
+        ):
             return
         self._registered_tool_names = _register_server_tools(
             self.name, self, self._config
@@ -2986,6 +3012,7 @@ class MCPServerTask:
                             self.name, _MAX_INITIAL_CONNECT_RETRIES, exc,
                         )
                         self._error = exc
+                        self._parked_initial_failure = True
                         self._ready.set()
                         self._deregister_tools()
                         self._reconnect_event.clear()
@@ -3174,6 +3201,12 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+# Initial-connect failures deliberately keep their run task parked so they can
+# self-probe and revive.  start() still reports the connection error, so those
+# objects have not yet reached the normal _servers registration point.  Track
+# them separately: discovery must not create duplicates, revival must promote
+# them atomically, and shutdown must await them before closing the event loop.
+_pending_servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 
@@ -3251,7 +3284,7 @@ def _signal_reconnect(server: Any) -> bool:
 def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(server_name) or _pending_servers.get(server_name)
     if server is None:
         return False
     return _signal_reconnect(server)
@@ -3659,8 +3692,8 @@ _mcp_tool_server_names: Dict[str, str] = {}
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
-# Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
+# Protects _mcp_loop, _mcp_thread, _servers/_pending_servers, MCP connection
+# status maps, _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -4036,7 +4069,30 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
-    await server.start(config)
+    with _lock:
+        _pending_servers[name] = server
+
+    def _forget_pending(_task: asyncio.Task) -> None:
+        """Drop a connecting/parked entry when its run task terminates."""
+        with _lock:
+            if _pending_servers.get(name) is server:
+                _pending_servers.pop(name, None)
+
+    try:
+        await server.start(config)
+    except BaseException:
+        # Retryable initial failures intentionally remain pending while run()
+        # parks for revival. Fatal validation/auth failures and cancelled
+        # connection attempts must release their provisional ownership.
+        if not server._parked_initial_failure:
+            with _lock:
+                if _pending_servers.get(name) is server:
+                    _pending_servers.pop(name, None)
+        raise
+    finally:
+        task = server._task
+        if task is not None:
+            task.add_done_callback(_forget_pending)
     return server
 
 
@@ -5139,6 +5195,8 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         timeout=connect_timeout,
     )
     with _lock:
+        if _pending_servers.get(name) is server:
+            _pending_servers.pop(name, None)
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
@@ -5186,18 +5244,32 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if (
+                k not in _servers
+                and k not in _pending_servers
+                and _parse_boolish(v.get("enabled", True), default=True)
+            )
         }
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
         # _signal_reconnect — without this nudge a new session silently
         # waits up to _PARKED_RETRY_INTERVAL for the next self-probe
         # (#50170). Wake them now so their tools come back promptly.
-        stale_cached = [
-            _servers[k]
-            for k in servers
-            if k in _servers and getattr(_servers[k], "session", None) is None
-        ]
+        stale_cached = []
+        for server_name in servers:
+            cached_server = _servers.get(server_name)
+            if cached_server is None:
+                pending_server = _pending_servers.get(server_name)
+                if (
+                    pending_server is not None
+                    and pending_server._parked_initial_failure
+                ):
+                    cached_server = pending_server
+            if (
+                cached_server is not None
+                and getattr(cached_server, "session", None) is None
+            ):
+                stale_cached.append(cached_server)
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
@@ -5304,7 +5376,11 @@ def discover_mcp_tools() -> List[str]:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if (
+                name not in _servers
+                and name not in _pending_servers
+                and _parse_boolish(cfg.get("enabled", True), default=True)
+            )
         ]
 
     tool_names = register_mcp_servers(servers)
@@ -5710,6 +5786,11 @@ def shutdown_mcp_servers():
     """
     with _lock:
         servers_snapshot = list(_servers.values())
+        servers_snapshot.extend(
+            server
+            for name, server in _pending_servers.items()
+            if name not in _servers
+        )
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
@@ -5728,6 +5809,7 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            _pending_servers.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -5880,9 +5962,10 @@ def _stop_mcp_loop_if_idle() -> bool:
 
     Probe paths create temporary MCPServerTask instances that are not placed in
     ``_servers``.  They should clean up an otherwise-idle loop, but must not
-    tear down the process-global loop when live agent tools are registered on
-    it.  Otherwise a dashboard/CLI probe can make later MCP tool calls fail
-    with ``MCP event loop is not running``.
+    tear down the process-global loop when live agent tools or an initial
+    parked server are registered on it.  Otherwise a dashboard/CLI probe can
+    make later MCP tool calls fail with ``MCP event loop is not running`` or
+    destroy a pending revival task.
     """
     return _stop_mcp_loop(only_if_idle=True)
 
@@ -5891,7 +5974,9 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
     with _lock:
-        if only_if_idle and (_servers or _server_connecting):
+        if only_if_idle and (
+            _servers or _pending_servers or _server_connecting
+        ):
             logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
             return False
         loop = _mcp_loop

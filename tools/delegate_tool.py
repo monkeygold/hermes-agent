@@ -22,6 +22,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import subprocess
 import threading
 import time
 from concurrent.futures import (
@@ -38,6 +39,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import propagate_context_to_thread
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -98,6 +100,24 @@ def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
     return "once"
 
 
+_subagent_sandbox_runtime = threading.local()
+
+
+def _subagent_sandbox_auto_approve(
+    command: str, description: str, **kwargs
+) -> str:
+    """Approve only after this worker verified its restricted Docker runtime."""
+    if getattr(_subagent_sandbox_runtime, "active", False) is True:
+        return _subagent_auto_approve(command, description, **kwargs)
+    logger.warning(
+        "Subagent auto-denied dangerous command because its Docker sandbox "
+        "was not verified: %s (%s)",
+        command,
+        description,
+    )
+    return "deny"
+
+
 def _get_subagent_approval_callback():
     """Return the callback to install into subagent worker threads.
 
@@ -106,6 +126,13 @@ def _get_subagent_approval_callback():
     priority is config.yaml > (no env override for this knob) > default.
     """
     cfg = _load_config()
+    sandbox_cfg = cfg.get("sandbox") or {}
+    if (
+        isinstance(sandbox_cfg, dict)
+        and is_truthy_value(sandbox_cfg.get("enabled", False))
+        and is_truthy_value(sandbox_cfg.get("auto_approve", False))
+    ):
+        return _subagent_sandbox_auto_approve
     val = cfg.get("subagent_auto_approve", False)
     if is_truthy_value(val):
         return _subagent_auto_approve
@@ -129,7 +156,7 @@ _MIN_SPAWN_DEPTH = 1
 # Operator-approved task routes. ``auto`` classifies the bounded task before
 # credentials are resolved; provider/model/effort still come from
 # ``delegation.routes`` so the runtime never invents a provider.
-_DELEGATION_ROUTES = frozenset({"auto", "kimi", "luna"})
+_DELEGATION_ROUTES = frozenset({"auto", "kimi", "luna", "qoder"})
 _UNSET = object()
 # No upper ceiling on spawn depth — like max_concurrent_children, depth has a
 # floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
@@ -357,7 +384,7 @@ def _normalize_role(r: Optional[str]) -> str:
 
 
 def _normalize_route(route: Optional[str]) -> str:
-    """Normalize a model-facing route to ``auto``, ``kimi``, or ``luna``."""
+    """Normalize a model-facing route to an operator-approved executor."""
     if route is None or not str(route).strip():
         return "auto"
     normalized = str(route).strip().lower()
@@ -370,20 +397,27 @@ def _normalize_route(route: Optional[str]) -> str:
 def _classify_delegation_route(goal: str, context: Optional[str] = None) -> str:
     """Choose the conservative configured route for one bounded task.
 
-    Luna owns implementation, debugging, security, and review. Kimi owns
-    bounded discovery, research, documentation, and test execution. Ambiguous
-    work falls back to Luna because it is the safer executor for tasks that may
-    turn into code changes.
+    Qoder owns implementation and code modification. Luna owns debugging,
+    security, review, architecture, and operational work. Kimi owns bounded
+    discovery, research, documentation, and test execution. Ambiguous work
+    falls back to Luna as the conservative executor.
     """
     text = f"{goal}\n{context or ''}".casefold()
     luna_markers = (
-        "implement", "implément", "corrig", "fix", "patch", "bug", "debug",
-        "débog", "modifi", "edit", "refactor", "migrat", "security", "sécur",
-        "vuln", "audit", "review", "revue", "architecture", "incident",
-        "permission", "auth", "deploy", "production", "live",
+        "corrig", "fix", "patch", "bug", "debug", "débog", "security",
+        "sécur", "vuln", "audit", "review", "revue", "architecture",
+        "incident", "permission", "auth", "deploy", "production", "live",
     )
     if any(marker in text for marker in luna_markers):
         return "luna"
+
+    qoder_markers = (
+        "implement", "implément", "modifi", "edit", "refactor", "migrat",
+        "develop", "développ", "code", "feature", "fonctionnal", "build",
+        "create", "cré", "ajout", "add ",
+    )
+    if any(marker in text for marker in qoder_markers):
+        return "qoder"
 
     kimi_markers = (
         "research", "recherch", "scan", "inspect", "cartograph", "document",
@@ -677,6 +711,8 @@ _SUMMARY_HEADROOM_FRACTION = 0.5
 # Floor so a single summary always gets a usable slice even when the parent is
 # already nearly full — below this we'd be truncating to noise.
 _MIN_SUMMARY_CHARS = 2000
+_DEFAULT_SUBAGENT_SANDBOX_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
+_HERMES_SANDBOX_ROUTES = frozenset({"kimi", "luna"})
 # No default wall-clock cap on child agents: legitimate heavy subagent work
 # (deep reviews, research fan-outs, slow reasoning models) was being killed
 # mid-task. Errors should come from what the child actually does; stuck-child
@@ -747,6 +783,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    sandbox_expected: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -769,6 +806,16 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+    if sandbox_expected:
+        parts.append(
+            "\nRUNTIME ISOLATION:\n"
+            "Hermes is configured to start and verify a dedicated Docker sandbox "
+            "before your first model call. Terminal and file operations use "
+            "/workspace, which is the only writable host bind mount. Hermes "
+            "credentials, skills, caches, extra volumes, and forwarded environment "
+            "variables are not mounted. If verification fails, this task aborts "
+            "instead of falling back to local execution."
+        )
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -778,6 +825,12 @@ def _build_child_system_prompt(
         "- Any issues encountered\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+        "Permission and sandbox rule: A denied tool call is a constraint, not task completion. "
+        "Do not stop merely because one operation was denied. Stay inside the stated workspace, "
+        "choose a safe non-destructive alternative, and continue through verification. Never claim "
+        "to be sandboxed unless the runtime explicitly reports isolation. Do not request a bypass or "
+        "privilege escalation. If no safe alternative can meet the acceptance criteria, report the "
+        "exact blocked operation and why it is necessary.\n\n"
         "Keep your final summary tight: lead with outcomes, prefer bullet "
         "points over paragraphs, and don't replay your whole process. Your "
         "response is returned to the parent agent as a summary, and overlong "
@@ -824,7 +877,18 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    recorded_cwd = None
+    try:
+        from tools.terminal_tool import get_session_cwd
+
+        recorded_cwd = get_session_cwd(
+            getattr(parent_agent, "_current_task_id", None)
+        )
+    except Exception:
+        pass
+
     candidates = [
+        recorded_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -842,6 +906,85 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if os.path.isabs(text) and os.path.isdir(text):
             return text
     return None
+
+
+def _resolve_git_workspace(path: Optional[str]) -> Optional[str]:
+    """Resolve a narrow, writable standard Git checkout or fail closed."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    forbidden = {
+        os.path.realpath(os.path.sep),
+        os.path.realpath(os.path.expanduser("~")),
+    }
+    if candidate in forbidden or not os.path.isdir(candidate):
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", candidate, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    root = os.path.realpath(proc.stdout.strip())
+    if root in forbidden or not os.path.isdir(root):
+        return None
+    # A linked worktree's .git file points outside the checkout. Mounting only
+    # the checkout would make Git operations fail, while mounting its common
+    # metadata directory would widen host access. Reject it instead.
+    if not os.path.isdir(os.path.join(root, ".git")):
+        return None
+    if not os.access(root, os.R_OK | os.W_OK):
+        return None
+    return root
+
+
+def _resolve_subagent_sandbox(
+    delegation_cfg: Dict[str, Any],
+    route: Optional[str],
+    workspace_hint: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Return a restricted Docker plan for configured Hermes-native routes."""
+    sandbox_cfg = delegation_cfg.get("sandbox") or {}
+    if not isinstance(sandbox_cfg, dict) or not is_truthy_value(
+        sandbox_cfg.get("enabled", False)
+    ):
+        return None
+    if route not in _HERMES_SANDBOX_ROUTES:
+        return None
+    if str(sandbox_cfg.get("backend", "docker")).strip().lower() != "docker":
+        logger.warning(
+            "Delegation sandbox disabled for route %s: only the native Docker "
+            "backend is supported",
+            route,
+        )
+        return None
+    workspace = _resolve_git_workspace(workspace_hint)
+    if workspace is None:
+        logger.warning(
+            "Delegation sandbox unavailable for route %s: workspace must be a "
+            "narrow writable standard Git checkout (got %r). Dangerous commands "
+            "will remain auto-denied.",
+            route,
+            workspace_hint,
+        )
+        return None
+    image = str(
+        sandbox_cfg.get("image") or _DEFAULT_SUBAGENT_SANDBOX_IMAGE
+    ).strip()
+    if not image:
+        return None
+    return {
+        "backend": "docker",
+        "image": image,
+        "host_workspace": workspace,
+        "network": is_truthy_value(sandbox_cfg.get("network", True)),
+    }
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -1231,13 +1374,17 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    sandbox_plan = _resolve_subagent_sandbox(
+        delegation_cfg, route, workspace_hint
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
-        workspace_path=workspace_hint,
+        workspace_path="/workspace" if sandbox_plan else workspace_hint,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        sandbox_expected=bool(sandbox_plan),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1333,9 +1480,10 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
+        # Preserve a configured ACP provider identity (for example qoder-acp).
+        # Legacy command-only configs still default to copilot-acp.
+        if not override_provider:
+            effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
     # Resolve reasoning config: delegation override > parent inherit
@@ -1461,6 +1609,7 @@ def _build_child_agent(
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
     child._delegate_route = route
+    child._delegate_sandbox = sandbox_plan
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1847,6 +1996,68 @@ def _child_reasoning_effort(child: Any) -> Optional[str]:
     return effort if isinstance(effort, str) else None
 
 
+def _child_sandbox_overrides(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the fail-closed per-task Docker policy for a delegated worker."""
+    return {
+        "env_type": "docker",
+        "docker_image": plan["image"],
+        "cwd": "/workspace",
+        "host_cwd": plan["host_workspace"],
+        "docker_mount_cwd_to_workspace": True,
+        "container_persistent": False,
+        "docker_persist_across_processes": False,
+        "docker_orphan_reaper": False,
+        "docker_volumes": [],
+        "docker_forward_env": [],
+        "docker_env": {},
+        "docker_extra_args": [],
+        "docker_run_as_host_user": False,
+        "docker_network": bool(plan.get("network", True)),
+        "docker_mount_host_resources": False,
+    }
+
+
+def _verify_child_sandbox(task_id: str, plan: Dict[str, Any]) -> None:
+    """Create and attest the child Docker sandbox before its first LLM call."""
+    from tools.environments.docker import DockerEnvironment
+    from tools.terminal_tool import (
+        get_active_env,
+        terminal_tool,
+    )
+
+    try:
+        result = json.loads(terminal_tool("pwd", task_id=task_id, timeout=30))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Subagent Docker sandbox preflight returned invalid data: {exc}"
+        ) from exc
+    if result.get("exit_code") != 0 or result.get("status") in {
+        "blocked",
+        "disabled",
+        "error",
+    }:
+        detail = result.get("error") or result.get("output") or "unknown error"
+        raise RuntimeError(f"Subagent Docker sandbox preflight failed: {detail}")
+
+    env = get_active_env(task_id)
+    expected_workspace = os.path.realpath(plan["host_workspace"])
+    actual_workspace = os.path.realpath(
+        getattr(env, "_bound_host_cwd", "") or ""
+    )
+    pwd_lines = [line.strip() for line in str(result.get("output", "")).splitlines()]
+    pwd_lines = [line for line in pwd_lines if line]
+    if (
+        not isinstance(env, DockerEnvironment)
+        or actual_workspace != expected_workspace
+        or getattr(env, "_mount_host_resources", True) is not False
+        or not pwd_lines
+        or pwd_lines[-1] != "/workspace"
+    ):
+        raise RuntimeError(
+            "Subagent Docker sandbox attestation failed; refusing local fallback"
+        )
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -1859,6 +2070,38 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_task_id: Optional[str] = None
+    sandbox_registered = False
+    sandbox_worker_started = threading.Event()
+    sandbox_cleanup_lock = threading.Lock()
+    sandbox_cleanup_done = threading.Event()
+
+    def _remove_child_sandbox_environment() -> None:
+        if not child_task_id:
+            return
+        from tools.terminal_tool import cleanup_vm, get_active_env
+
+        env = get_active_env(child_task_id)
+        cleanup_vm(child_task_id, force_remove=True)
+        waiter = getattr(env, "wait_for_cleanup", None)
+        if callable(waiter) and not waiter(timeout=30):
+            logger.warning(
+                "Timed out waiting for subagent %d Docker cleanup", task_index
+            )
+
+    def _cleanup_child_sandbox() -> None:
+        if not sandbox_registered or not child_task_id:
+            return
+        with sandbox_cleanup_lock:
+            if sandbox_cleanup_done.is_set():
+                return
+            from tools.terminal_tool import clear_task_env_overrides
+
+            try:
+                _remove_child_sandbox_environment()
+            finally:
+                clear_task_env_overrides(child_task_id)
+                sandbox_cleanup_done.set()
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2022,6 +2265,14 @@ def _run_single_child(
             record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
+        sandbox_plan = getattr(child, "_delegate_sandbox", None)
+        if isinstance(sandbox_plan, dict):
+            from tools.terminal_tool import register_task_env_overrides
+
+            register_task_env_overrides(
+                child_task_id, _child_sandbox_overrides(sandbox_plan)
+            )
+            sandbox_registered = True
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
@@ -2061,13 +2312,35 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-            )
+            sandbox_worker_started.set()
+            try:
+                if sandbox_registered:
+                    _verify_child_sandbox(child_task_id, sandbox_plan)
+                    _subagent_sandbox_runtime.active = True
+                    logger.info(
+                        "Subagent %d Docker sandbox verified for %s",
+                        task_index,
+                        sandbox_plan["host_workspace"],
+                    )
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                    stream_callback=_relay_child_text,
+                )
+            finally:
+                _subagent_sandbox_runtime.active = False
+                _cleanup_child_sandbox()
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # A subagent adds one more executor boundary below the parent tool
+        # worker.  Preserve the originating gateway/ACP/CLI approval context
+        # across it so a host-visible command reaches the *native* approval
+        # surface for that same user/session.  The executor initializer remains
+        # the fail-closed fallback when no owner context is available; inside a
+        # verified no-host-access Docker sandbox the normal container guard
+        # fast-path still avoids unnecessary prompts.
+        _child_future = _timeout_executor.submit(
+            propagate_context_to_thread(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2081,6 +2354,17 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if is_timeout and sandbox_registered and child_task_id:
+                # Stop the isolated runtime immediately, but keep its task
+                # override registered until the worker actually unwinds. That
+                # prevents a late tool call from falling back to the host-local
+                # default after a timeout.
+                try:
+                    _remove_child_sandbox_environment()
+                except Exception:
+                    logger.debug(
+                        "Failed to stop timed-out child sandbox", exc_info=True
+                    )
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2411,6 +2695,13 @@ def _run_single_child(
         }
 
     finally:
+        if sandbox_registered and not sandbox_worker_started.is_set():
+            # Executor creation/submission failed before the worker could own
+            # cleanup. No model call ran, so clearing the override is safe.
+            try:
+                _cleanup_child_sandbox()
+            except Exception:
+                logger.debug("Failed to clean unused child sandbox", exc_info=True)
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
@@ -2509,8 +2800,9 @@ def delegate_task(
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
 
     The 'route' parameter selects an operator-configured executor. ``auto``
-    deterministically chooses Kimi for bounded evidence work and Luna for code,
-    debugging, security, review, or ambiguous tasks. Per-task route wins.
+    deterministically chooses Kimi for bounded evidence work, Qoder for
+    implementation/code changes, and Luna for debugging, security, review,
+    operations, or ambiguous tasks. Per-task route wins.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2709,8 +3001,12 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    # ThreadPoolExecutor does not inherit ContextVars.  Each
+                    # branch needs its own context snapshot so approvals from
+                    # parallel children are routed to the originating session
+                    # instead of being mistaken for a local auto-denial.
                     future = executor.submit(
-                        _run_single_child,
+                        propagate_context_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,
@@ -3614,11 +3910,12 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "route": {
                             "type": "string",
-                            "enum": ["auto", "kimi", "luna"],
+                            "enum": ["auto", "kimi", "luna", "qoder"],
                             "description": (
                                 "Per-task executor route. auto chooses Kimi for "
-                                "bounded evidence work and Luna for code, debug, "
-                                "security, review, or ambiguous work."
+                                "bounded evidence work, Qoder for implementation "
+                                "and code changes, and Luna for debug, security, "
+                                "review, operations, or ambiguous work."
                             ),
                         },
                     },
@@ -3636,11 +3933,12 @@ DELEGATE_TASK_SCHEMA = {
             },
             "route": {
                 "type": "string",
-                "enum": ["auto", "kimi", "luna"],
+                "enum": ["auto", "kimi", "luna", "qoder"],
                 "description": (
                     "Executor route for a single task or default for a batch. "
-                    "auto chooses Kimi for bounded evidence work and Luna for "
-                    "code, debugging, security, review, or ambiguous work."
+                    "auto chooses Kimi for bounded evidence work, Qoder for "
+                    "implementation and code changes, and Luna for debugging, "
+                    "security, review, operations, or ambiguous work."
                 ),
             },
             "background": {

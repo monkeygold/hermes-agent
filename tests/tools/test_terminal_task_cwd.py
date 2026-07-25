@@ -43,6 +43,60 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
     assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/acp", "bounded_capture": True})]
 
 
+def test_delegated_task_cwd_beats_inherited_parent_approval_cwd(monkeypatch):
+    """Approval routing may be inherited, but a sandbox child owns its cwd."""
+    calls = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace"
+
+        def execute(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"output": "/workspace\n", "returncode": 0}
+
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    parent_session_key = "gateway-parent"
+    child_task_id = "sandbox-child"
+    host_cwd = "/root/projects/personal-hermes-platform"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {child_task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_task_env_overrides",
+        {child_task_id: {"cwd": "/workspace"}},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _minimal_terminal_config(cwd="/workspace"),
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+    terminal_tool.record_session_cwd(parent_session_key, host_cwd)
+    terminal_tool.record_session_cwd(child_task_id, "/workspace")
+
+    token = set_current_session_key(parent_session_key)
+    try:
+        result = json.loads(
+            terminal_tool.terminal_tool(command="pwd", task_id=child_task_id)
+        )
+    finally:
+        reset_current_session_key(token)
+
+    assert result["exit_code"] == 0
+    assert calls == [
+        ("pwd", {"timeout": 60, "cwd": "/workspace", "bounded_capture": True})
+    ]
+    assert terminal_tool.get_session_cwd(child_task_id) == "/workspace"
+    assert terminal_tool.get_session_cwd(parent_session_key) == host_cwd
+
+
 def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     calls = []
 

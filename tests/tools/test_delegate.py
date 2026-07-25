@@ -36,6 +36,8 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
     _resolve_delegation_route,
+    _resolve_subagent_sandbox,
+    _verify_child_sandbox,
     _inherit_parent_base_url,
 )
 
@@ -73,10 +75,12 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
-        self.assertEqual(props["route"]["enum"], ["auto", "kimi", "luna"])
+        self.assertEqual(
+            props["route"]["enum"], ["auto", "kimi", "luna", "qoder"]
+        )
         self.assertEqual(
             props["tasks"]["items"]["properties"]["route"]["enum"],
-            ["auto", "kimi", "luna"],
+            ["auto", "kimi", "luna", "qoder"],
         )
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
@@ -103,11 +107,21 @@ class TestDelegationRoutes(unittest.TestCase):
             "kimi",
         )
 
-    def test_auto_classifier_routes_code_and_ambiguous_work_to_luna(self):
+    def test_auto_classifier_routes_debug_and_ambiguous_work_to_luna(self):
         self.assertEqual(
             _classify_delegation_route("Fix the authentication bug"), "luna"
         )
         self.assertEqual(_classify_delegation_route("Handle this task"), "luna")
+
+    def test_auto_classifier_routes_implementation_to_qoder(self):
+        self.assertEqual(
+            _classify_delegation_route("Implement a bounded code change"),
+            "qoder",
+        )
+        self.assertEqual(
+            _classify_delegation_route("Refactor the parser"),
+            "qoder",
+        )
 
     def test_route_config_pins_effective_executor(self):
         cfg = {
@@ -147,6 +161,26 @@ class TestDelegationRoutes(unittest.TestCase):
         )
         self.assertEqual(name, "luna")
         self.assertEqual(effective["model"], "gpt-5.6-luna")
+
+    def test_explicit_qoder_route_is_supported_and_matches_auto_policy(self):
+        cfg = {
+            "routes": {
+                "qoder": {
+                    "model": "Qwen3.8-Max-Preview",
+                    "provider": "qoder-acp",
+                }
+            }
+        }
+        name, effective = _resolve_delegation_route(
+            {"goal": "Implement a bounded change", "route": "qoder"},
+            None,
+            cfg,
+        )
+        self.assertEqual(name, "qoder")
+        self.assertEqual(effective["provider"], "qoder-acp")
+        self.assertEqual(
+            _classify_delegation_route("Implement a bounded change"), "qoder"
+        )
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -317,6 +351,83 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_permission_denial_requires_safe_recovery_not_early_exit(self):
+        prompt = _build_child_system_prompt("Implement and verify the change")
+        self.assertIn("A denied tool call is a constraint, not task completion", prompt)
+        self.assertIn("choose a safe non-destructive alternative", prompt)
+        self.assertIn("Never claim to be sandboxed", prompt)
+        self.assertIn("Do not request a bypass or privilege escalation", prompt)
+
+    def test_verified_sandbox_contract_is_explicit(self):
+        prompt = _build_child_system_prompt(
+            "Implement and verify the change",
+            workspace_path="/workspace",
+            sandbox_expected=True,
+        )
+        self.assertIn("dedicated Docker sandbox", prompt)
+        self.assertIn("only writable host bind mount", prompt)
+        self.assertIn("aborts instead of falling back to local execution", prompt)
+
+
+class TestSubagentSandboxPlan(unittest.TestCase):
+    @patch("tools.delegate_tool._resolve_git_workspace", return_value="/srv/repo")
+    def test_only_native_kimi_luna_routes_get_docker_plan(self, _mock_git):
+        cfg = {
+            "sandbox": {
+                "enabled": True,
+                "backend": "docker",
+                "image": "sandbox:test",
+                "network": False,
+            }
+        }
+        luna = _resolve_subagent_sandbox(cfg, "luna", "/srv/repo/subdir")
+        self.assertEqual(luna["host_workspace"], "/srv/repo")
+        self.assertEqual(luna["image"], "sandbox:test")
+        self.assertFalse(luna["network"])
+        self.assertIsNone(
+            _resolve_subagent_sandbox(cfg, "qoder", "/srv/repo/subdir")
+        )
+
+    @patch("tools.delegate_tool._resolve_git_workspace", return_value=None)
+    def test_invalid_workspace_fails_closed(self, _mock_git):
+        cfg = {"sandbox": {"enabled": True, "auto_approve": True}}
+        self.assertIsNone(_resolve_subagent_sandbox(cfg, "kimi", "/root"))
+
+    @patch("tools.terminal_tool.terminal_tool")
+    @patch("tools.terminal_tool.get_active_env")
+    def test_runtime_attestation_requires_restricted_docker(
+        self, mock_get_env, mock_terminal
+    ):
+        from tools.environments.docker import DockerEnvironment
+
+        env = DockerEnvironment.__new__(DockerEnvironment)
+        env._bound_host_cwd = "/srv/repo"
+        env._mount_host_resources = False
+        mock_get_env.return_value = env
+        mock_terminal.return_value = json.dumps(
+            {"output": "/workspace\n", "exit_code": 0}
+        )
+
+        _verify_child_sandbox(
+            "sa-test",
+            {
+                "host_workspace": "/srv/repo",
+                "image": "sandbox:test",
+                "network": True,
+            },
+        )
+
+        env._mount_host_resources = True
+        with self.assertRaisesRegex(RuntimeError, "attestation failed"):
+            _verify_child_sandbox(
+                "sa-test",
+                {
+                    "host_workspace": "/srv/repo",
+                    "image": "sandbox:test",
+                    "network": True,
+                },
+            )
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -421,6 +532,61 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][0]["summary"], "Result A")
         self.assertEqual(result["results"][1]["summary"], "Result B")
         self.assertIn("total_duration_seconds", result)
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_batch_workers_inherit_originating_approval_context(self, mock_run):
+        """Parallel branches keep the gateway session that owns approvals."""
+        from gateway.session_context import (
+            clear_session_vars,
+            get_session_env,
+            set_session_vars,
+        )
+        from tools.approval import (
+            get_current_session_key,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        observed = {}
+
+        def _run(*, task_index, **_kwargs):
+            observed[task_index] = (
+                get_current_session_key(default=""),
+                get_session_env("HERMES_SESSION_PLATFORM", ""),
+            )
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": f"Result {task_index}",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+            }
+
+        mock_run.side_effect = _run
+        tokens = set_session_vars(
+            platform="telegram",
+            session_key="delegate-batch-owner",
+        )
+        approval_token = set_current_session_key("delegate-batch-owner")
+        try:
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "Task A"}, {"goal": "Task B"}],
+                    parent_agent=_make_mock_parent(),
+                )
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(
+            observed,
+            {
+                0: ("delegate-batch-owner", "telegram"),
+                1: ("delegate-batch-owner", "telegram"),
+            },
+        )
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_accepts_json_string_tasks(self, mock_run):
@@ -770,6 +936,39 @@ class TestToolNamePreservation(unittest.TestCase):
 
         self.assertEqual(captured["provider"], "copilot-acp")
         self.assertEqual(captured["acp_command"], "copilot")
+
+    def test_build_child_agent_preserves_explicit_qoder_acp_provider(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "shutil.which", return_value="/root/.local/bin/qodercli"
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="qoder path",
+                context=None,
+                toolsets=None,
+                model="Qwen3.8-Max-Preview",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="qoder-acp",
+                override_base_url="acp://qoder",
+                override_api_key="qoder-acp",
+                override_api_mode="chat_completions",
+                override_acp_command="qodercli",
+                override_acp_args=["--acp", "--model", "Qwen3.8-Max-Preview"],
+            )
+
+            _, kwargs = MockAgent.call_args
+
+        self.assertEqual(kwargs["provider"], "qoder-acp")
+        self.assertEqual(kwargs["acp_command"], "qodercli")
+        self.assertEqual(
+            kwargs["acp_args"],
+            ["--acp", "--model", "Qwen3.8-Max-Preview"],
+        )
 
     def test_schema_never_exposes_acp_transport_fields(self):
         """delegate_task must never make ACP transport model-facing."""
@@ -3270,6 +3469,30 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
         self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
 
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "sandbox": {"enabled": True, "auto_approve": True},
+            "subagent_auto_approve": False,
+        },
+    )
+    def test_sandbox_approval_is_active_only_after_attestation(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_sandbox_runtime,
+        )
+
+        callback = _get_subagent_approval_callback()
+        _subagent_sandbox_runtime.active = False
+        self.assertEqual(callback("rm -rf build", "recursive delete"), "deny")
+        try:
+            _subagent_sandbox_runtime.active = True
+            self.assertEqual(
+                callback("rm -rf build", "recursive delete"), "once"
+            )
+        finally:
+            _subagent_sandbox_runtime.active = False
+
     def test_executor_initializer_installs_callback_in_worker(self):
         """The initializer sets the callback on the worker thread's TLS,
         not the parent's — verifies the fix actually scopes to workers.
@@ -3300,6 +3523,78 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(seen, [_subagent_auto_deny])
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_auto_approve": False},
+    )
+    @patch("tools.approval._get_approval_mode", return_value="manual")
+    def test_child_host_command_uses_originating_native_gateway_prompt(
+        self, _mock_mode, _mock_cfg
+    ):
+        """A child fallback denial must not masquerade as a user refusal."""
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            register_gateway_notify,
+            reset_current_session_key,
+            resolve_gateway_approval,
+            set_current_session_key,
+            unregister_gateway_notify,
+        )
+        from tools.delegate_tool import _run_single_child
+
+        session_key = "delegate-native-approval-owner"
+        notified = []
+        child_decisions = []
+
+        def _notify(payload):
+            notified.append(payload)
+            resolve_gateway_approval(session_key, "once")
+
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_sandbox = None
+        child._subagent_id = None
+
+        def _run(**_kwargs):
+            decision = check_all_command_guards(
+                "rm -rf /important-subagent-output", "local"
+            )
+            child_decisions.append(decision)
+            return {
+                "final_response": "continued after native approval",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = _run
+        register_gateway_notify(session_key, _notify)
+        tokens = set_session_vars(
+            platform="telegram",
+            session_key=session_key,
+        )
+        approval_token = set_current_session_key(session_key)
+        try:
+            result = _run_single_child(
+                task_index=0,
+                goal="Run a bounded host-visible command",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+            unregister_gateway_notify(session_key)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(notified), 1)
+        self.assertIn("rm -rf /important-subagent-output", notified[0]["command"])
+        self.assertEqual(len(child_decisions), 1)
+        self.assertTrue(child_decisions[0]["approved"])
+        self.assertTrue(child_decisions[0]["user_approved"])
 
 
 class TestFallbackModelInheritance(unittest.TestCase):

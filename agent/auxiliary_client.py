@@ -295,6 +295,8 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "qoder": "qoder-acp",
+    "qoder-cli": "qoder-acp",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -5256,32 +5258,40 @@ def resolve_provider_client(
                 else (client, final_model))
 
     if pconfig.auth_type == "external_process":
-        creds = resolve_external_process_provider_credentials(provider)
         final_model = _normalize_resolved_model(
             model
             or (main_runtime.get("model") if main_runtime else None)
             or _read_main_model(),
             provider,
         )
-        if provider == "copilot-acp":
+        creds = resolve_external_process_provider_credentials(
+            provider,
+            target_model=final_model,
+        )
+        from agent.copilot_acp_client import (
+            CopilotACPClient,
+            is_acp_process_runtime,
+        )
+
+        if is_acp_process_runtime(provider, creds.get("base_url")):
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             if not final_model:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but no model "
-                    "was provided or configured"
+                    "resolve_provider_client: %s requested but no model "
+                    "was provided or configured",
+                    provider,
                 )
                 return None, None
             if not api_key or not base_url:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but external "
-                    "process credentials are incomplete"
+                    "resolve_provider_client: %s requested but external "
+                    "process credentials are incomplete",
+                    provider,
                 )
                 return None, None
-            from agent.copilot_acp_client import CopilotACPClient
-
             client = CopilotACPClient(
                 api_key=api_key,
                 base_url=base_url,

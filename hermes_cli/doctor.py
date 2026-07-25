@@ -417,8 +417,8 @@ def _build_apikey_providers_list() -> list:
         ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                        "https://api.minimaxi.com/v1/models",  "MINIMAX_CN_BASE_URL", False),
         ("Kilo Code",        ("KILOCODE_API_KEY",),                          "https://api.kilo.ai/api/gateway/models", "KILOCODE_BASE_URL", True),
         ("OpenCode Zen",     ("OPENCODE_ZEN_API_KEY",),                      "https://opencode.ai/zen/v1/models",  "OPENCODE_ZEN_BASE_URL", True),
-        # OpenCode Go has no shared /models endpoint; skip the health check.
-        ("OpenCode Go",      ("OPENCODE_GO_API_KEY",),                       None,                                  "OPENCODE_GO_BASE_URL", False),
+        # OpenCode Go exposes a Bearer-authenticated OpenAI-compatible catalog.
+        ("OpenCode Go",      ("OPENCODE_GO_API_KEY",),                       "https://opencode.ai/zen/go/v1/models", "OPENCODE_GO_BASE_URL", True),
     ]
     _known_names = {t[0] for t in _static}
     # Also index by profile canonical name so profiles without display_name

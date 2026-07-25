@@ -8,6 +8,31 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_qoder_acp_resolves_as_an_independent_process_provider(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.auth.shutil.which",
+        lambda command: f"/root/.local/bin/{command}",
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="qoder-acp",
+        target_model="Qwen3.8-Max-Preview",
+    )
+
+    assert resolved["provider"] == "qoder-acp"
+    assert resolved["api_key"] == "qoder-acp"
+    assert resolved["base_url"] == "acp://qoder"
+    assert resolved["command"] == "/root/.local/bin/qodercli"
+    assert resolved["args"] == [
+        "--acp",
+        "--permission-mode",
+        "auto",
+        "--model",
+        "Qwen3.8-Max-Preview",
+    ]
+    assert resolved["api_mode"] == "chat_completions"
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(

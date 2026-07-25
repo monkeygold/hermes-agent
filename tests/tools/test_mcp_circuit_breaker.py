@@ -569,3 +569,132 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
             run_task.cancel()
 
     asyncio.run(_scenario())
+
+
+def test_initial_connect_parked_task_is_awaited_by_global_shutdown(
+    monkeypatch, tmp_path
+):
+    """A pre-registration parked task must not outlive the MCP event loop.
+
+    ``start()`` reports the initial connection error while ``run()`` remains
+    parked for revival.  The public shutdown path must still own and await that
+    task before closing the process-global loop; otherwise coroutine finalizers
+    later call ``Task.cancel()`` on an already-closed loop.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+
+    real_task_class = mcp_tool.MCPServerTask
+    instances = []
+
+    class _AlwaysFailingTask(real_task_class):
+        def __init__(self, name):
+            super().__init__(name)
+            instances.append(self)
+
+        def _is_http(self):
+            return False
+
+        async def _run_stdio(self, config):
+            raise RuntimeError("server still booting")
+
+    monkeypatch.setattr(mcp_tool, "MCPServerTask", _AlwaysFailingTask)
+    monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 60.0)
+
+    mcp_tool._servers.clear()
+    mcp_tool._pending_servers.clear()
+    mcp_tool._server_connecting.clear()
+    mcp_tool._server_connect_errors.clear()
+
+    mcp_tool.register_mcp_servers({
+        "initially_down": {
+            "command": "unused-test-command",
+            "connect_timeout": 1.0,
+        }
+    })
+
+    assert len(instances) == 1
+    parked_task = instances[0]._task
+    assert parked_task is not None
+    assert not parked_task.done(), "the failed initial connection did not park"
+
+    mcp_tool.shutdown_mcp_servers()
+
+    assert parked_task.done(), "shutdown closed the loop with a parked task pending"
+    assert mcp_tool._mcp_loop is None
+    assert not mcp_tool._pending_servers
+
+
+def test_initial_connect_parked_server_promotes_without_duplicate(
+    monkeypatch, tmp_path
+):
+    """A later discovery wakes and promotes the original parked instance."""
+    import time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+
+    real_task_class = mcp_tool.MCPServerTask
+    instances = []
+    backend_up = False
+
+    class _RecoveringTask(real_task_class):
+        def __init__(self, name):
+            super().__init__(name)
+            instances.append(self)
+
+        def _is_http(self):
+            return False
+
+        async def _run_stdio(self, config):
+            if not backend_up:
+                raise RuntimeError("server still booting")
+            self.session = object()
+            self._tools = []
+            # Real transports call this from _discover_tools() immediately
+            # before setting _ready on a successful connection.
+            self._register_discovered_tools_if_needed()
+            self._ready.set()
+            return await self._wait_for_lifecycle_event()
+
+    monkeypatch.setattr(mcp_tool, "MCPServerTask", _RecoveringTask)
+    monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 60.0)
+
+    mcp_tool._servers.clear()
+    mcp_tool._pending_servers.clear()
+    mcp_tool._server_connecting.clear()
+    mcp_tool._server_connect_errors.clear()
+
+    config = {
+        "initially_down": {
+            "command": "unused-test-command",
+            "connect_timeout": 1.0,
+        }
+    }
+
+    try:
+        mcp_tool.register_mcp_servers(config)
+        assert len(instances) == 1
+        assert mcp_tool._pending_servers["initially_down"] is instances[0]
+        assert "initially_down" not in mcp_tool._servers
+
+        backend_up = True
+        mcp_tool.register_mcp_servers(config)
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if mcp_tool._servers.get("initially_down") is instances[0]:
+                break
+            time.sleep(0.01)
+
+        assert len(instances) == 1, "discovery created a duplicate parked server"
+        assert mcp_tool._servers.get("initially_down") is instances[0]
+        assert "initially_down" not in mcp_tool._pending_servers
+        assert "initially_down" not in mcp_tool._server_connect_errors
+        assert instances[0].session is not None
+    finally:
+        mcp_tool.shutdown_mcp_servers()

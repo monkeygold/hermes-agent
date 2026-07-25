@@ -84,6 +84,7 @@ _STRIP_VENDOR_ONLY_PROVIDERS: frozenset[str] = frozenset({
 
 # Providers whose native naming is authoritative -- pass through unchanged.
 _AUTHORITATIVE_NATIVE_PROVIDERS: frozenset[str] = frozenset({
+    "qoder-acp",
     "huggingface",
 })
 
@@ -470,4 +471,3 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
 # ---------------------------------------------------------------------------
 # Batch / convenience helpers
 # ---------------------------------------------------------------------------
-

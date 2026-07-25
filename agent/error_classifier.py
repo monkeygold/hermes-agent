@@ -924,6 +924,19 @@ def _classify_by_status(
         )
 
     if status_code == 403:
+        # OpenCode Go sits behind a CDN/WAF which can return an HTML error page
+        # for transient edge failures.  That response says nothing about the
+        # Bearer key itself; treating it as auth makes the credential pool
+        # persistently quarantine a valid subscription key.  Keep structured
+        # or plain-text 403 responses on the normal auth/billing paths below.
+        if provider == "opencode-go" and (
+            "<html" in error_msg or "<!doctype html" in error_msg
+        ):
+            return result_fn(
+                FailoverReason.server_error,
+                retryable=True,
+                should_rotate_credential=False,
+            )
         # OpenRouter 403 "key limit exceeded" is actually billing. Other
         # providers also use 403 for account-plan or credit exhaustion.
         if (

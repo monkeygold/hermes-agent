@@ -801,7 +801,7 @@ def test_run_doctor_dashscope_retries_china_endpoint_after_intl_unauthorized(mon
 
 
 @pytest.mark.parametrize("base_url", [None, "https://opencode.ai/zen/go/v1"])
-def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path, base_url):
+def test_run_doctor_opencode_go_probes_models_endpoint(monkeypatch, tmp_path, base_url):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
@@ -847,12 +847,16 @@ def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path
         doctor_mod.run_doctor(Namespace(fix=False))
     out = buf.getvalue()
 
-    assert any(
-        "OpenCode Go" in line and "(key configured)" in line
-        for line in out.splitlines()
-    )
-    assert not any(url == "https://opencode.ai/zen/go/v1/models" for url, _, _ in calls)
-    assert not any("opencode" in url.lower() and "models" in url.lower() for url, _, _ in calls)
+    assert any("OpenCode Go" in line for line in out.splitlines())
+    opencode_calls = [
+        (url, headers, timeout)
+        for url, headers, timeout in calls
+        if url == "https://opencode.ai/zen/go/v1/models"
+    ]
+    assert len(opencode_calls) == 1
+    _, headers, timeout = opencode_calls[0]
+    assert headers["Authorization"] == "Bearer sk-test"
+    assert timeout == 10
 
 
 class TestGitHubTokenCheck:

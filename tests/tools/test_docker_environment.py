@@ -51,7 +51,39 @@ def _make_dummy_env(**kwargs):
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
         persist_across_processes=kwargs.get("persist_across_processes", True),
+        mount_host_resources=kwargs.get("mount_host_resources", True),
     )
+
+
+def test_restricted_sandbox_skips_all_auxiliary_host_mounts(monkeypatch, tmp_path):
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env,
+        "_append_host_resource_mounts",
+        lambda _args: pytest.fail("auxiliary host mounts must stay disabled"),
+    )
+
+    env = _make_dummy_env(
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        mount_host_resources=False,
+        persist_across_processes=False,
+    )
+
+    run_calls = [
+        call
+        for call in calls
+        if isinstance(call[0], list) and len(call[0]) >= 2 and call[0][1] == "run"
+    ]
+    assert run_calls
+    run_args = run_calls[0][0]
+    assert f"{project_dir}:/workspace" in run_args
+    assert env._bound_host_cwd == str(project_dir)
+    assert env._mount_host_resources is False
 
 
 def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, caplog):
