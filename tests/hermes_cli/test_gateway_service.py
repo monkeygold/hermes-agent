@@ -563,6 +563,18 @@ class TestGeneratedSystemdUnits:
         # tool-call children before systemd SIGKILLs the cgroup — #8202.
         assert "KillMode=mixed" in unit
 
+    def test_user_local_path_probe_ignores_permission_errors(self, tmp_path, monkeypatch):
+        original_exists = Path.exists
+
+        def guarded_exists(path):
+            if path == tmp_path / ".local" / "bin":
+                raise PermissionError("unreadable home")
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+
+        assert gateway_cli._build_user_local_paths(tmp_path, []) == []
+
 
 class TestGatewayStopCleanup:
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):

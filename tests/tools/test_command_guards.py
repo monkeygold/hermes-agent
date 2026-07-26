@@ -11,6 +11,7 @@ from tools.approval import (
     check_all_command_guards,
     check_dangerous_command,
     is_approved,
+    load_permanent,
     set_current_session_key,
     reset_current_session_key,
 )
@@ -246,7 +247,7 @@ class TestCommandAllowlistGlobs:
                                        "container run"))
     def test_glob_allowlist_bypasses_combined_guard(self, mock_tirith):
         os.environ["HERMES_INTERACTIVE"] = "1"
-        approval_module._permanent_approved.add("podman *")
+        load_permanent({"podman *"})
 
         result = check_all_command_guards(
             'podman run --rm docker.io/library/busybox:latest echo "ok"',
@@ -258,7 +259,7 @@ class TestCommandAllowlistGlobs:
 
     def test_glob_allowlist_bypasses_dangerous_pattern_guard(self):
         os.environ["HERMES_INTERACTIVE"] = "1"
-        approval_module._permanent_approved.add("bash -c *")
+        load_permanent({"bash -c *"})
 
         result = check_dangerous_command("bash -c 'echo ok'", "local")
 
@@ -266,7 +267,7 @@ class TestCommandAllowlistGlobs:
 
     def test_glob_allowlist_does_not_bypass_hardline_floor(self):
         os.environ["HERMES_INTERACTIVE"] = "1"
-        approval_module._permanent_approved.add("rm *")
+        load_permanent({"rm *"})
 
         result = check_all_command_guards("rm -rf /", "local")
 
@@ -294,7 +295,7 @@ class TestCommandAllowlistGlobs:
         self, mock_tirith, command
     ):
         os.environ["HERMES_INTERACTIVE"] = "1"
-        approval_module._permanent_approved.add("podman *")
+        load_permanent({"podman *"})
         cb = MagicMock(return_value="once")
 
         result = check_all_command_guards(command, "local", approval_callback=cb)

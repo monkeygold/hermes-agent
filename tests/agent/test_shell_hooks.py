@@ -738,12 +738,16 @@ class TestAllowlistConcurrency:
         p = shell_hooks.allowlist_path()
         p.parent.mkdir(parents=True, exist_ok=True)
 
-        tmp_paths_seen: list = []
+        publication_tmp_paths: list = []
+        rollback_paths: list = []
         real_mkstemp = shell_hooks.tempfile.mkstemp
 
         def spying_mkstemp(*args, **kwargs):
             fd, path = real_mkstemp(*args, **kwargs)
-            tmp_paths_seen.append(path)
+            if path.endswith(".tmp"):
+                publication_tmp_paths.append(path)
+            elif path.endswith(".rollback.link"):
+                rollback_paths.append(path)
             return fd, path
 
         monkeypatch.setattr(shell_hooks.tempfile, "mkstemp", spying_mkstemp)
@@ -751,5 +755,6 @@ class TestAllowlistConcurrency:
         shell_hooks.save_allowlist({"approvals": [{"event": "a", "command": "x"}]})
         shell_hooks.save_allowlist({"approvals": [{"event": "b", "command": "y"}]})
 
-        assert len(tmp_paths_seen) == 2
-        assert tmp_paths_seen[0] != tmp_paths_seen[1]
+        assert len(publication_tmp_paths) == 2
+        assert publication_tmp_paths[0] != publication_tmp_paths[1]
+        assert len(rollback_paths) == 1
