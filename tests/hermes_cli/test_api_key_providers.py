@@ -51,6 +51,11 @@ class TestProviderRegistry:
         assert pconfig.auth_type == auth_type
         assert pconfig.inference_base_url  # must have a default base URL
 
+    def test_qoder_acp_is_exposed_in_the_canonical_model_picker(self):
+        from hermes_cli.models import CANONICAL_PROVIDERS
+
+        assert "qoder-acp" in {entry.slug for entry in CANONICAL_PROVIDERS}
+
     def test_zai_env_vars(self):
         pconfig = PROVIDER_REGISTRY["zai"]
         assert pconfig.api_key_env_vars == ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY")
