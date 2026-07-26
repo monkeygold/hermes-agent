@@ -944,6 +944,28 @@ def test_logout_defaults_to_configured_codex_when_no_active_provider(tmp_path, m
     assert "provider: auto" in config_text
 
 
+def test_logout_defaults_to_any_configured_oauth_provider(tmp_path, monkeypatch, capsys):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "credential_pool": {}})
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: qwen/test-model\n"
+        "  provider: qwen-oauth\n"
+        "  base_url: https://portal.qwen.ai/v1\n"
+    )
+
+    from types import SimpleNamespace
+    from hermes_cli.auth import logout_command
+
+    logout_command(SimpleNamespace(provider=None))
+
+    out = capsys.readouterr().out
+    assert "Logged out of Qwen OAuth." in out
+    config_text = (hermes_home / "config.yaml").read_text()
+    assert "provider: auto" in config_text
+
+
 def test_logout_clears_stale_active_codex_without_provider_credentials(tmp_path, monkeypatch, capsys):
     """Logout must clear active_provider even when provider credential payloads are gone."""
     hermes_home = tmp_path / "hermes"
@@ -977,8 +999,8 @@ def test_logout_clears_stale_active_codex_without_provider_credentials(tmp_path,
     assert "provider: auto" in config_text
 
 
-def test_reset_config_provider_uses_atomic_yaml_write(tmp_path, monkeypatch):
-    """Logout config reset should delegate the YAML write atomically."""
+def test_reset_config_provider_uses_atomic_transaction_write(tmp_path, monkeypatch):
+    """Logout config reset should publish YAML through the shared transaction."""
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -994,18 +1016,24 @@ def test_reset_config_provider_uses_atomic_yaml_write(tmp_path, monkeypatch):
     original_text = config_path.read_text(encoding="utf-8")
 
     from hermes_cli.auth import _reset_config_provider
+    from hermes_cli.config_store import ConfigTransactionError
 
-    def _boom(path, data, **kwargs):
-        assert path == config_path
+    def _boom(source, target, **kwargs):
+        assert kwargs["follow_symlinks"] is False
+        assert target == config_path
+        data = yaml.safe_load(source.read_text(encoding="utf-8"))
         assert data["model"]["provider"] == "auto"
         assert data["model"]["base_url"] == "https://openrouter.ai/api/v1"
-        assert kwargs["sort_keys"] is False
         raise OSError("simulated atomic write failure")
 
-    with patch("hermes_cli.auth.atomic_yaml_write", side_effect=_boom) as mock_write:
-        with pytest.raises(OSError, match="simulated atomic write failure"):
+    with patch("hermes_cli.config_store.atomic_replace", side_effect=_boom) as mock_write:
+        with pytest.raises(
+            ConfigTransactionError,
+            match="configuration publish failed: simulated atomic write failure",
+        ) as excinfo:
             _reset_config_provider()
 
+    assert isinstance(excinfo.value.__cause__, OSError)
     assert mock_write.call_count == 1
     assert config_path.read_text(encoding="utf-8") == original_text
 

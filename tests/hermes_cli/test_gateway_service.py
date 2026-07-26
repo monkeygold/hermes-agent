@@ -539,10 +539,10 @@ class TestGeneratedSystemdUnits:
     def test_system_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
         monkeypatch.setattr(
             gateway_cli,
-            "_get_restart_drain_timeout",
-            lambda: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+            "_get_restart_drain_timeout_for_home",
+            lambda _home: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="root")
 
         assert "ExecStart=" in unit
         assert "ExecStop=" not in unit
@@ -562,6 +562,18 @@ class TestGeneratedSystemdUnits:
         # KillMode=mixed is preserved so the gateway still reaps its own
         # tool-call children before systemd SIGKILLs the cgroup — #8202.
         assert "KillMode=mixed" in unit
+
+    def test_user_local_path_probe_ignores_permission_errors(self, tmp_path, monkeypatch):
+        original_exists = Path.exists
+
+        def guarded_exists(path):
+            if path == tmp_path / ".local" / "bin":
+                raise PermissionError("unreadable home")
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+
+        assert gateway_cli._build_user_local_paths(tmp_path, []) == []
 
 
 class TestGatewayStopCleanup:
@@ -1983,6 +1995,12 @@ class TestSystemUnitHermesHome:
         # Simulate sudo: Path.home() returns /root, target user is alice
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+
+        def reject_calling_user_config():
+            raise AssertionError("system unit read the calling user's config")
+
+        monkeypatch.setattr(gateway_cli, "read_raw_config", reject_calling_user_config)
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
             lambda run_as_user=None: ("alice", "alice", "/home/alice"),
@@ -1996,6 +2014,43 @@ class TestSystemUnitHermesHome:
 
         assert 'HERMES_HOME=/home/alice/.hermes' in unit
         assert '/root/.hermes' not in unit
+
+    def test_target_timeout_read_is_read_only_and_owner_independent(
+        self, tmp_path, monkeypatch,
+    ):
+        home = tmp_path / "alice" / ".hermes"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "agent:\n  restart_drain_timeout: 17\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("target timeout used the caller-bound config reader")
+            ),
+        )
+
+        assert gateway_cli._get_restart_drain_timeout_for_home(home) == 17
+
+    def test_target_timeout_falls_back_while_transaction_journal_exists(
+        self, tmp_path, monkeypatch,
+    ):
+        home = tmp_path / "alice" / ".hermes"
+        lock_root = home / ".config-locks"
+        lock_root.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "agent:\n  restart_drain_timeout: 17\n",
+            encoding="utf-8",
+        )
+        (lock_root / "transaction-test.json").write_text("{}", encoding="utf-8")
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+
+        assert gateway_cli._get_restart_drain_timeout_for_home(home) == (
+            DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+        )
 
     def test_system_unit_remaps_profile_to_target_user(self, monkeypatch):
         # Simulate sudo with a profile: HERMES_HOME was resolved under root
@@ -2239,7 +2294,7 @@ class TestGeneratedUnitIncludesLocalBin:
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="root")
         # System unit uses the resolved home dir from _system_service_identity
         assert "/.local/bin" in unit
 

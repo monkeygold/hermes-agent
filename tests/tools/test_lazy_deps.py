@@ -120,30 +120,34 @@ class TestSecurityGating:
 
     def test_disabled_via_env_var(self, monkeypatch):
         monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
-        # Bypass config layer; the env var alone must disable.
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"security": {"allow_lazy_installs": True}},
-        )
         assert ld._allow_lazy_installs() is False
 
-    def test_default_allows(self, monkeypatch):
+    def test_default_allows(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"security": {}},
-        )
         assert ld._allow_lazy_installs() is True
 
-    def test_config_failure_fails_open(self, monkeypatch):
-        # If config can't be read at all, we ALLOW installs rather than
-        # blocking the user out of their own backends.
+    def test_config_failure_fails_closed(self, tmp_path, monkeypatch):
+        # A broken on-disk config must not bypass an operator's kill switch.
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text("security: [broken", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: (_ for _ in ()).throw(RuntimeError("config broken")),
-        )
-        assert ld._allow_lazy_installs() is True
+
+        assert ld._allow_lazy_installs() is False
+
+    def test_managed_config_failure_fails_closed(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        managed = tmp_path / "managed"
+        home.mkdir()
+        managed.mkdir()
+        (managed / "config.yaml").write_text("security: [broken", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+
+        assert ld._allow_lazy_installs() is False
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +196,28 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="pip install failed"):
             ld.ensure("test.fail", prompt=False)
+
+    def test_install_failure_redacts_pip_credentials(self, monkeypatch):
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.redact", ("zzzfake>=1",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        credential = "build-user:" + "private-index-password"
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda specs, **kw: ld._InstallResult(
+                False,
+                "",
+                f"ERROR fetching https://{credential}@packages.example/simple",
+            ),
+        )
+
+        with pytest.raises(ld.FeatureUnavailable) as excinfo:
+            ld.ensure("test.redact", prompt=False)
+
+        rendered = str(excinfo.value)
+        assert "private-index-password" not in rendered
+        assert "packages.example" in rendered
 
     def test_install_succeeds_but_still_missing_raises(self, monkeypatch):
         # Pip says success but the package still isn't importable

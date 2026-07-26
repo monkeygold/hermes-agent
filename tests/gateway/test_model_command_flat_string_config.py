@@ -11,6 +11,9 @@ before mutation, so ``--global`` succeeds and the config is rewritten in
 the proper ``model: {default: ..., provider: ...}`` form.
 """
 
+import threading
+import types
+
 import yaml
 import pytest
 
@@ -199,3 +202,151 @@ async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     # Config untouched — the session override is in-memory only.
     assert written["model"]["default"] == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_model_text_switch_exception_is_not_exposed(
+    tmp_path, monkeypatch, caplog,
+):
+    """Text /model replies must not interpolate provider exception text."""
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "text-r11-faux-secret"
+
+    def _raise_switch(**_kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _raise_switch)
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    assert "saved" not in result.lower()
+    assert "--global" not in result
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "RuntimeError" in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_model_text_switch_failure_result_log_is_redacted(
+    tmp_path, monkeypatch, caplog,
+):
+    """A failed text switch result must not interpolate provider error text."""
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "text-r11-result-secret"
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: types.SimpleNamespace(success=False, error_message=secret),
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert result is not None
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_model_text_persistence_exception_has_no_global_confirmation(
+    tmp_path, monkeypatch, caplog,
+):
+    """A failed text-path global config write must not claim it was saved."""
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    secret = "text-r11-persist-secret"
+
+    def _raise_save(*_args):
+        raise OSError(secret)
+
+    monkeypatch.setattr("hermes_cli.config_store.atomic_replace", _raise_save)
+    runner = _make_runner()
+
+    result = await runner._handle_model_command(
+        _make_event("/model gpt-5.5 --global")
+    )
+
+    assert secret not in result
+    assert "model switch failed" in result.lower()
+    assert "saved" not in result.lower()
+    assert "--global" not in result
+    assert runner._session_model_overrides == {}
+    assert getattr(runner, "_pending_model_notes", {}) == {}
+    rendered_logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    assert secret not in rendered_logs
+    assert "ConfigTransactionError" in rendered_logs
+    assert "[REDACTED]" in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_model_text_persistence_failure_restores_complete_cached_agent_state(
+    tmp_path, monkeypatch,
+):
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    runner = _make_runner()
+    monkeypatch.setattr(runner, "_agent_cache_lock", threading.Lock(), raising=False)
+    monkeypatch.setattr(runner, "_agent_cache", {}, raising=False)
+    event = _make_event("/model gpt-5.5 --global")
+    calls = []
+
+    class CachedAgent:
+        model = "runtime-model"
+        provider = "runtime-provider"
+        api_key = ""
+        base_url = "https://runtime.invalid/v1"
+        api_mode = "runtime-mode"
+        _client_kwargs = {"api_key": "", "base_url": base_url}
+
+        def switch_model(self, **kwargs):
+            calls.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            if kwargs["api_key"]:
+                self.api_key = kwargs["api_key"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+            self._client_kwargs = {
+                "api_key": kwargs["api_key"] or self.api_key,
+                "base_url": kwargs["base_url"] or self.base_url,
+            }
+
+    session_key = runner._session_key_for_source(event.source)
+    cached_agent = CachedAgent()
+    runner._agent_cache[session_key] = (cached_agent, 0, None)
+
+    def fail_persist(*_args, **_kwargs):
+        raise OSError("injected text persistence failure")
+
+    monkeypatch.setattr("hermes_cli.config_store.atomic_replace", fail_persist)
+
+    reply = await runner._handle_model_command(event)
+
+    assert reply is not None
+    assert "model switch failed" in reply.lower()
+    assert calls[-1] == {
+        "new_model": "runtime-model",
+        "new_provider": "runtime-provider",
+        "api_key": "",
+        "base_url": "https://runtime.invalid/v1",
+        "api_mode": "runtime-mode",
+    }
+    assert calls[0]["api_key"] == "sk-test"
+    assert cached_agent.api_key == ""
+    assert cached_agent._client_kwargs["api_key"] == ""

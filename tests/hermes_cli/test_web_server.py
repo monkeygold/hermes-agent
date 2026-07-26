@@ -532,6 +532,33 @@ class TestWebServerEndpoints:
         assert provider_config["api_url"] == "http://localhost:8888"
         assert "api_key" not in provider_config
 
+    def test_declared_provider_failure_removes_all_created_parent_dirs(self, monkeypatch):
+        import hermes_cli.config_store as config_store
+        import hermes_cli.web_server as web_server
+        from hermes_cli.memory_providers import get_memory_provider
+        from hermes_constants import get_hermes_home
+
+        provider = get_memory_provider("hindsight")
+        assert provider is not None
+        home = get_hermes_home()
+        nested_root = home / "declared" / "nested"
+        target = nested_root / "config.json"
+        monkeypatch.setattr(
+            web_server,
+            "_declared_provider_file_path",
+            lambda _provider: target,
+        )
+
+        def fail_transaction(*_args, **_kwargs):
+            raise RuntimeError("publish failed")
+
+        monkeypatch.setattr(config_store, "update_transaction", fail_transaction)
+
+        with pytest.raises(RuntimeError, match="publish failed"):
+            web_server._update_declared_provider_config(provider, {"mode": "cloud"})
+
+        assert not (home / "declared").exists()
+
     def test_declared_surface_put_rejects_undeclared_provider(self):
         resp = self.client.put(
             "/api/memory/providers/honcho/config?surface=declared",
@@ -2204,6 +2231,26 @@ class TestWebServerEndpoints:
         data = resp.json()
         # Should contain known env var names
         assert any(k.endswith("_API_KEY") or k.endswith("_TOKEN") for k in data.keys())
+
+    def test_set_env_var_managed_preflight_has_no_side_effects(
+        self, tmp_path, monkeypatch,
+    ):
+        import hermes_cli.web_server as web_server
+
+        home = tmp_path / "managed-home-must-remain-absent"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(web_server, "is_managed", lambda: True)
+
+        resp = self.client.put(
+            "/api/env",
+            json={"key": "OPENAI_API_KEY", "value": "synthetic-not-a-secret"},
+        )
+
+        assert resp.status_code == 403
+        assert resp.json() == {
+            "detail": "Configuration is managed outside this dashboard"
+        }
+        assert not home.exists()
 
     def test_get_env_vars_marks_channel_managed_keys(self):
         from hermes_cli.web_server import _channel_managed_env_keys
@@ -4261,7 +4308,11 @@ class TestNewEndpoints:
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
         (get_hermes_home() / "config.yaml").write_text(
             "model:\n  provider: openrouter\n",
             encoding="utf-8",
@@ -4288,7 +4339,11 @@ class TestNewEndpoints:
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         # Create a source profile and give it a distinctive skill.
         assert self.client.post("/api/profiles", json={"name": "source-prof"}).status_code == 200
@@ -4312,7 +4367,11 @@ class TestNewEndpoints:
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         assert self.client.post("/api/profiles", json={"name": "full-src"}).status_code == 200
         source_dir = get_hermes_home() / "profiles" / "full-src"
@@ -4334,7 +4393,11 @@ class TestNewEndpoints:
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         def fake_seed(profile_dir, quiet=False):
             skill_dir = profile_dir / "skills" / "software-development" / "plan"
@@ -4355,6 +4418,67 @@ class TestNewEndpoints:
         profiles = {p["name"]: p for p in self.client.get("/api/profiles").json()["profiles"]}
         assert profiles["fresh"]["skill_count"] == 1
 
+    def test_profiles_create_model_failure_rolls_back_profile(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(profiles_mod, "seed_profile_skills", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: pytest.fail("wrapper must not be published after model failure"),
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_write_profile_model",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private detail")),
+        )
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "model-failure", "provider": "openrouter", "model": "test/model"},
+        )
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Failed to persist requested model"
+        assert not (get_hermes_home() / "profiles" / "model-failure").exists()
+        assert "private detail" not in resp.text
+
+    def test_profiles_create_cleanup_failure_quarantines_profile(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(profiles_mod, "seed_profile_skills", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: pytest.fail("wrapper must not be published after model failure"),
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_write_profile_model",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private detail")),
+        )
+        monkeypatch.setattr(
+            web_server.shutil,
+            "rmtree",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup denied")),
+        )
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "cleanup-failure", "provider": "openrouter", "model": "test/model"},
+        )
+
+        profiles_root = get_hermes_home() / "profiles"
+        assert resp.status_code == 500
+        assert not (profiles_root / "cleanup-failure").exists()
+        assert len(list(profiles_root.glob(".cleanup-failure.failed-*"))) == 1
+        assert "private detail" not in resp.text
+        assert "cleanup denied" not in resp.text
+
     def test_profiles_create_builder_fields_model_mcp_and_keep_skills(self, monkeypatch):
         """Profile-builder create: model + MCP servers + keep-skills selection
         all land in the NEW profile's config, and hub installs are spawned
@@ -4369,7 +4493,11 @@ class TestNewEndpoints:
         import hermes_cli.profiles as profiles_mod
         import hermes_cli.web_server as web_server
 
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         # Seed two known skills so keep-skills "replace" has something to act on.
         def fake_seed(profile_dir, quiet=False):
@@ -4443,7 +4571,11 @@ class TestNewEndpoints:
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         secret = "profile-builder-secret"
         resp = self.client.post(
@@ -4600,7 +4732,11 @@ class TestNewEndpoints:
 
     def test_profiles_set_active_round_trip(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         self.client.post("/api/profiles", json={"name": "router"})
 
@@ -4615,7 +4751,11 @@ class TestNewEndpoints:
 
     def test_profile_description_round_trip(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         self.client.post("/api/profiles", json={"name": "desc-prof"})
 
@@ -4641,7 +4781,11 @@ class TestNewEndpoints:
     def test_profile_model_round_trip(self, monkeypatch):
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         self.client.post("/api/profiles", json={"name": "model-prof"})
 
@@ -4660,7 +4804,11 @@ class TestNewEndpoints:
 
     def test_profile_model_requires_provider_and_model(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         self.client.post("/api/profiles", json={"name": "model-prof2"})
         resp = self.client.put(
@@ -4671,7 +4819,11 @@ class TestNewEndpoints:
 
     def test_profile_describe_auto_success(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         self.client.post("/api/profiles", json={"name": "auto-prof"})
 
@@ -4693,7 +4845,11 @@ class TestNewEndpoints:
 
     def test_profile_describe_auto_failure_is_not_auto(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        monkeypatch.setattr(
+            profiles_mod,
+            "create_wrapper_script",
+            lambda name: profiles_mod._get_wrapper_dir() / name,
+        )
 
         self.client.post("/api/profiles", json={"name": "auto-fail"})
 

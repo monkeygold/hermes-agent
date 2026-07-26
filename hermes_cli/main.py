@@ -3848,10 +3848,57 @@ def _save_custom_provider(
 
 
 
+def _custom_provider_stable_identity(entry):
+    """Return a canonical full-entry identity for compare-and-delete.
+
+    A URL or name alone is not an identity: another process may replace the
+    selected provider with a different entry that deliberately reuses either.
+    Canonicalizing the complete parsed value preserves list reorder support
+    while making every concurrent field change fail closed.
+    """
+
+    def _freeze(value):
+        if isinstance(value, dict):
+            return (
+                "mapping",
+                tuple(
+                    sorted(
+                        ((str(key), _freeze(item)) for key, item in value.items()),
+                        key=lambda pair: pair[0],
+                    )
+                ),
+            )
+        if isinstance(value, list):
+            return ("list", tuple(_freeze(item) for item in value))
+        return (
+            "scalar",
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            repr(value),
+        )
+
+    return _freeze(entry)
+
+
 def _remove_custom_provider(config):
     """Let the user remove a saved custom provider from config.yaml."""
-    from hermes_cli.config import load_config, save_config
+    import yaml
 
+    from hermes_cli.config import (
+        ManagedConfigWriteError,
+        get_config_path,
+        get_hermes_home,
+        invalidate_config_caches,
+        is_managed,
+        load_config,
+        require_readable_config_before_write,
+        serialize_yaml_bytes,
+    )
+    from hermes_cli.config_store import update_transaction
+
+    if is_managed():
+        raise ManagedConfigWriteError(
+            "Cannot remove custom providers in managed mode"
+        )
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
     if not isinstance(providers, list) or not providers:
@@ -3893,13 +3940,45 @@ def _remove_custom_provider(config):
         except (ValueError, KeyboardInterrupt, EOFError):
             idx = None
 
-    if idx is None or idx >= len(providers):
+    if idx is None or idx < 0 or idx >= len(providers):
         print("No change.")
         return
 
-    removed = providers.pop(idx)
-    cfg["custom_providers"] = providers
-    save_config(cfg)
+    selected_identity = _custom_provider_stable_identity(providers[idx])
+    config_path = get_config_path()
+    require_readable_config_before_write(config_path)
+    removed_holder = []
+
+    def _update(current):
+        raw = current[config_path]
+        current_cfg = yaml.safe_load(raw.decode("utf-8")) if raw is not None else {}
+        if current_cfg is None:
+            current_cfg = {}
+        if not isinstance(current_cfg, dict):
+            raise ValueError("config.yaml must contain a mapping")
+        current_providers = current_cfg.get("custom_providers") or []
+        if not isinstance(current_providers, list):
+            raise ValueError("custom_providers must contain a list")
+        for current_idx, entry in enumerate(current_providers):
+            if _custom_provider_stable_identity(entry) == selected_identity:
+                removed_holder.append(current_providers.pop(current_idx))
+                current_cfg["custom_providers"] = current_providers
+                return {
+                    config_path: serialize_yaml_bytes(current_cfg, sort_keys=False)
+                }
+        return {}
+
+    update_transaction(
+        [config_path],
+        _update,
+        home=get_hermes_home(),
+        surface="hermes_cli.main.remove_custom_provider",
+    )
+    if not removed_holder:
+        print("No change; the selected provider was already removed or changed.")
+        return
+    invalidate_config_caches(config_path)
+    removed = removed_holder[0]
     removed_name = (
         removed.get("name", "unnamed") if isinstance(removed, dict) else str(removed)
     )

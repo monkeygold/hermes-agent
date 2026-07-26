@@ -72,6 +72,10 @@ def _install_modal_test_modules(
     tools_package.__path__ = [str(TOOLS_DIR)]  # type: ignore[attr-defined]
     sys.modules["tools"] = tools_package
 
+    lazy_deps_module = types.ModuleType("tools.lazy_deps")
+    lazy_deps_module.ensure = lambda _feature, prompt=False: None  # type: ignore[attr-defined]
+    sys.modules["tools.lazy_deps"] = lazy_deps_module
+
     env_package = types.ModuleType("tools.environments")
     env_package.__path__ = [str(TOOLS_DIR / "environments")]  # type: ignore[attr-defined]
     sys.modules["tools.environments"] = env_package

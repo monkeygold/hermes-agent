@@ -50,42 +50,36 @@ class TestGatingWithTarget:
     target is configured — the redirect is the safe path — but the config
     kill switch still wins in every mode."""
 
-    def test_disable_env_blocks_without_target(self, monkeypatch):
+    def test_disable_env_blocks_without_target(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
-        # config unreadable → fails open on the config check, but the sealed
-        # env var with no target still blocks.
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
-        )
         assert ld._allow_lazy_installs() is False
 
     def test_disable_env_allows_with_target(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
         monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path))
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
-        )
         assert ld._allow_lazy_installs() is True
 
     def test_config_killswitch_wins_even_with_target(self, monkeypatch, tmp_path):
         # Explicit opt-out must disable installs even when a target exists.
-        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
-        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path))
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"security": {"allow_lazy_installs": False}},
-            raising=False,
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "security:\n  allow_lazy_installs: false\n",
+            encoding="utf-8",
         )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path / "target"))
         assert ld._allow_lazy_installs() is False
 
-    def test_normal_mode_unaffected(self, monkeypatch):
-        # No sealed env, no target → default allow (unchanged behaviour).
+    def test_normal_mode_unaffected(self, monkeypatch, tmp_path):
+        # No sealed env, no target, no config → default allow.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
-        )
         assert ld._allow_lazy_installs() is True
 
 

@@ -2546,7 +2546,17 @@ def _build_user_local_paths(home: Path, path_entries: list[str]) -> list[str]:
         str(home / "go" / "bin"),  # Go tools
         str(home / ".npm-global" / "bin"),  # npm global packages
     ]
-    return [p for p in candidates if p not in path_entries and Path(p).exists()]
+    result: list[str] = []
+    for candidate in candidates:
+        if candidate in path_entries:
+            continue
+        try:
+            exists = Path(candidate).exists()
+        except OSError:
+            exists = False
+        if exists:
+            result.append(candidate)
+    return result
 
 
 def _build_wsl_interop_paths(path_entries: list[str]) -> list[str]:
@@ -2738,12 +2748,11 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     # SIGKILL on the cgroup — otherwise bash/sleep tool-call children left
     # by a force-interrupted agent get reaped by systemd instead of us
     # (#8202). 30s of headroom covers the worst case we've observed.
-    _drain_timeout = int(_get_restart_drain_timeout() or 0)
-    restart_timeout = max(60, _drain_timeout) + 30
-
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
         hermes_home = _hermes_home_for_target_user(home_dir)
+        _drain_timeout = int(_get_restart_drain_timeout_for_home(hermes_home) or 0)
+        restart_timeout = max(60, _drain_timeout) + 30
         profile_arg = _profile_arg_for_target_user(hermes_home, home_dir)
         # Remap all paths that may resolve under the calling user's home
         # (e.g. /root/) to the target user's home so the service can
@@ -2794,6 +2803,8 @@ WantedBy=multi-user.target
 """
 
     hermes_home = str(get_hermes_home().resolve())
+    _drain_timeout = int(_get_restart_drain_timeout() or 0)
+    restart_timeout = max(60, _drain_timeout) + 30
     profile_arg = _profile_arg(hermes_home)
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
@@ -3127,6 +3138,37 @@ def _print_system_scope_remediation(action: str) -> None:
     print_info("         sudo hermes gateway uninstall --system")
     print_info("         hermes gateway install")
     print_info("         hermes gateway start")
+
+
+def _get_restart_drain_timeout_for_home(hermes_home: Path | str) -> float:
+    """Read a target profile timeout without mutating state owned by that user."""
+    raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
+    if raw:
+        return parse_restart_drain_timeout(raw)
+
+    home = Path(hermes_home)
+    lock_home = home.parent.parent if home.parent.name == "profiles" else home
+    lock_root = lock_home / ".config-locks"
+    config_path = home / "config.yaml"
+    try:
+        if lock_root.is_symlink():
+            return parse_restart_drain_timeout(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+        if lock_root.is_dir() and next(lock_root.glob("transaction-*.json"), None):
+            return parse_restart_drain_timeout(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+        if config_path.is_symlink() or not config_path.is_file():
+            return parse_restart_drain_timeout(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+        from utils import fast_safe_load
+
+        with config_path.open(encoding="utf-8") as handle:
+            cfg = fast_safe_load(handle) or {}
+    except Exception:  # noqa: BLE001 — unreadable target config falls back safely
+        cfg = {}
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    configured = agent_cfg.get(
+        "restart_drain_timeout",
+        DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    )
+    return parse_restart_drain_timeout(str(configured))
 
 
 def _get_restart_drain_timeout() -> float:

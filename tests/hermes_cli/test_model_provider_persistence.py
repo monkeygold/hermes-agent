@@ -70,30 +70,36 @@ class TestSaveModelChoiceAlwaysDict:
 
 
 class TestProviderPersistsAfterModelSave:
-    def test_update_config_for_provider_uses_atomic_yaml_write(self, config_home):
-        """Provider switches should delegate config writes to atomic_yaml_write."""
+    def test_update_config_for_provider_rolls_back_transaction(self, config_home):
+        """Provider switches roll back auth when config publication fails."""
         from hermes_cli.auth import _update_config_for_provider
+        from hermes_cli.config_store import ConfigTransactionError
+        import hermes_cli.config_store as config_store
 
         config_path = config_home / "config.yaml"
         original_text = config_path.read_text(encoding="utf-8")
+        auth_path = config_home / "auth.json"
+        assert not auth_path.exists()
+        real_replace = config_store.atomic_replace
+        calls = 0
 
-        def _boom(path, data, **kwargs):
-            assert path == config_path
-            assert data["model"]["provider"] == "nous"
-            assert data["model"]["base_url"] == "https://inference.example.com/v1"
-            assert data["model"]["default"] == "some-old-model"
-            assert kwargs["sort_keys"] is False
-            raise OSError("simulated atomic write failure")
+        def _boom(source, target, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated atomic write failure")
+            return real_replace(source, target, **kwargs)
 
-        with patch("hermes_cli.auth.atomic_yaml_write", side_effect=_boom) as mock_write:
-            with pytest.raises(OSError, match="simulated atomic write failure"):
+        with patch("hermes_cli.config_store.atomic_replace", side_effect=_boom):
+            with pytest.raises(ConfigTransactionError, match="simulated atomic write failure"):
                 _update_config_for_provider(
                     "nous",
                     "https://inference.example.com/v1/",
                     default_model="llama-3.3",
                 )
 
-        assert mock_write.call_count == 1
+        assert calls == 2
+        assert not auth_path.exists()
         assert config_path.read_text(encoding="utf-8") == original_text
 
     def test_api_key_provider_saved_when_model_was_string(self, config_home, monkeypatch):
