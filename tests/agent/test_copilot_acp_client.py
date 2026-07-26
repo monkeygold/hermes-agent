@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import CopilotACPClient, is_acp_process_runtime
 
 
 class _FakeProcess:
@@ -21,6 +21,16 @@ class _FakeProcess:
 class CopilotACPClientSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = CopilotACPClient(acp_cwd="/tmp")
+
+    def test_remote_acp_tcp_runtime_is_not_a_local_process(self) -> None:
+        self.assertFalse(is_acp_process_runtime("custom", "acp+tcp://host:1234"))
+        self.assertFalse(is_acp_process_runtime("copilot-acp", "acp+tcp://host:1234"))
+        self.assertFalse(is_acp_process_runtime("qoder-acp", "acp+tcp://host:1234"))
+
+    def test_local_acp_runtime_still_uses_the_process_client(self) -> None:
+        self.assertTrue(is_acp_process_runtime("copilot-acp", None))
+        self.assertTrue(is_acp_process_runtime("qoder-acp", None))
+        self.assertTrue(is_acp_process_runtime("custom", "acp://custom"))
 
     def test_extracted_tool_calls_match_openai_sdk_shape(self) -> None:
         tool_response = (

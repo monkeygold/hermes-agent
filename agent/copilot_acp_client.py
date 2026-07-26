@@ -79,9 +79,9 @@ def is_acp_process_runtime(provider: str | None, base_url: str | None) -> bool:
     """Return whether a runtime should use the local ACP client facade."""
     normalized_provider = str(provider or "").strip().lower()
     normalized_base = str(base_url or "").strip().lower()
-    return normalized_provider in ACP_PROCESS_PROVIDERS or normalized_base.startswith(
-        ("acp://", "acp+tcp://")
-    )
+    if normalized_base.startswith("acp+tcp://"):
+        return False
+    return normalized_provider in ACP_PROCESS_PROVIDERS or normalized_base.startswith("acp://")
 
 
 def _resolve_home_dir() -> str:
