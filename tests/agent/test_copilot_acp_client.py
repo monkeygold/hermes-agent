@@ -155,6 +155,53 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         outcome = (((response.get("result") or {}).get("outcome") or {}).get("outcome"))
         self.assertEqual(outcome, "cancelled")
 
+    def test_read_text_file_rejects_path_outside_session_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside.txt"
+            outside.write_text("must-not-be-read")
+
+            response = self._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "fs/read_text_file",
+                    "params": {"path": str(outside)},
+                },
+                cwd=str(workspace),
+            )
+
+        self.assertEqual((response.get("error") or {}).get("code"), -32602)
+        self.assertIn("outside the session cwd", str(response.get("error")))
+        self.assertNotIn("must-not-be-read", json.dumps(response))
+
+    def test_shell_and_network_methods_are_rejected_as_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "should-not-run"
+            for request_id, method in enumerate(
+                ("terminal/execute", "network/request"),
+                start=7,
+            ):
+                with self.subTest(method=method):
+                    response = self._dispatch(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": method,
+                            "params": {
+                                "command": f"touch {marker}",
+                                "url": "https://example.com",
+                            },
+                        },
+                        cwd=tmpdir,
+                    )
+
+                    self.assertEqual((response.get("error") or {}).get("code"), -32601)
+                    self.assertIn("not supported by Hermes", str(response.get("error")))
+                    self.assertFalse(marker.exists())
+
     def test_read_text_file_blocks_internal_hermes_hub_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"

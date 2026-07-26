@@ -5,6 +5,7 @@ configurable resource limits (CPU, memory, disk), and optional filesystem
 persistence via bind mounts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,55 @@ _DOCKER_SEARCH_PATHS = [
 
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _policy_safe_extra_args(extra_args: list[str]) -> list[str]:
+    """Keep policy-relevant Docker args without hashing environment values."""
+    safe: list[str] = []
+    redact_next_env = False
+    for arg in extra_args:
+        if redact_next_env:
+            safe.append(arg.split("=", 1)[0])
+            redact_next_env = False
+            continue
+        if arg in {"-e", "--env"}:
+            safe.append(arg)
+            redact_next_env = True
+            continue
+        if arg.startswith("--env="):
+            env_name = arg[len("--env="):].split("=", 1)[0]
+            safe.append(f"--env={env_name}")
+            continue
+        safe.append(arg)
+    return safe
+
+
+def _security_policy_fingerprint(
+    *,
+    image: str,
+    cwd: str,
+    security_args: list[str],
+    user_args: list[str],
+    writable_args: list[str],
+    resource_args: list[str],
+    volume_args: list[str],
+    extra_args: list[str],
+    mount_host_resources: bool,
+) -> str:
+    """Return a stable, non-secret fingerprint for container reuse policy."""
+    payload = {
+        "image": image,
+        "cwd": cwd,
+        "security_args": security_args,
+        "user_args": user_args,
+        "writable_args": writable_args,
+        "resource_args": resource_args,
+        "volume_args": volume_args,
+        "extra_args": _policy_safe_extra_args(extra_args),
+        "mount_host_resources": mount_host_resources,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:32]
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -853,6 +903,17 @@ class DockerEnvironment(BaseEnvironment):
             + env_args
             + validated_extra
         )
+        policy_fingerprint = _security_policy_fingerprint(
+            image=image,
+            cwd=cwd,
+            security_args=security_args,
+            user_args=user_args,
+            writable_args=writable_args,
+            resource_args=resource_args,
+            volume_args=volume_args,
+            extra_args=validated_extra,
+            mount_host_resources=bool(mount_host_resources),
+        )
         logger.info(f"Docker run_args: {all_run_args}")
 
         # Start the container directly via `docker run -d`.
@@ -870,6 +931,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"hermes-policy={policy_fingerprint}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -883,6 +945,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            "hermes-policy": policy_fingerprint,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -892,14 +955,19 @@ class DockerEnvironment(BaseEnvironment):
         # restores the documented contract; opt out via
         # ``terminal.docker_persist_across_processes: false``.
         #
-        # Reuse matches on labels only — we deliberately do NOT compare image
-        # / mounts / resources.  Operators who need a fresh container after
-        # changing those settings should set ``docker_persist_across_processes:
-        # false`` (or run ``docker rm -f`` against the labeled container) to
-        # force a clean start.
+        # Reuse requires the task/profile labels plus a deterministic policy
+        # fingerprint covering image, mounts, resources, user and security
+        # arguments. Environment values are deliberately excluded so secrets
+        # never become Docker label material. Containers created by older
+        # Hermes versions lack this label and therefore fail closed to a fresh
+        # container.
         reused = False
         if persist_across_processes:
-            existing = self._find_reusable_container(task_label, profile_name)
+            existing = self._find_reusable_container(
+                task_label,
+                profile_name,
+                policy_fingerprint,
+            )
             if existing is not None:
                 container_id, state = existing
                 # Network-mode guard: reuse must not silently defeat an
@@ -1111,7 +1179,11 @@ class DockerEnvironment(BaseEnvironment):
         # 1. Try label-based reuse (another process may have recreated it).
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
-        existing = self._find_reusable_container(task_label, profile_label)
+        existing = self._find_reusable_container(
+            task_label,
+            profile_label,
+            self._labels.get("hermes-policy", ""),
+        )
         if existing is not None:
             cid, state = existing
             if state == "running":
@@ -1270,8 +1342,13 @@ class DockerEnvironment(BaseEnvironment):
         mode = result.stdout.strip()
         return mode or None
 
-    def _find_reusable_container(self, task_label: str, profile_label: str) -> Optional[tuple[str, str]]:
-        """Look for an existing container labeled for this (task, profile).
+    def _find_reusable_container(
+        self,
+        task_label: str,
+        profile_label: str,
+        policy_fingerprint: str,
+    ) -> Optional[tuple[str, str]]:
+        """Look for an existing container matching task, profile, and policy.
 
         Returns ``(container_id, state)`` on hit, ``None`` on miss / on any
         failure (including ``docker ps`` itself failing). State is one of the
@@ -1290,6 +1367,7 @@ class DockerEnvironment(BaseEnvironment):
                     "--filter", "label=hermes-agent=1",
                     "--filter", f"label=hermes-task-id={task_label}",
                     "--filter", f"label=hermes-profile={profile_label}",
+                    "--filter", f"label=hermes-policy={policy_fingerprint}",
                     "--format", "{{.ID}}\t{{.State}}",
                 ],
                 capture_output=True,

@@ -422,6 +422,19 @@ class TestApiKeyProviderStatus:
         assert status["args"] == ["--acp"]
         assert status["base_url"] == "acp://qoder"
 
+    def test_get_auth_status_dispatches_qoder_to_external_process(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.auth.shutil.which",
+            lambda command: f"/root/.local/bin/{command}",
+        )
+
+        status = get_auth_status("qoder-acp")
+
+        assert status["configured"] is True
+        assert status["logged_in"] is True
+        assert status["provider"] == "qoder-acp"
+        assert status["command"] == "qodercli"
+
     def test_non_api_key_provider(self):
         status = get_api_key_provider_status("nous")
         assert status["configured"] is False
