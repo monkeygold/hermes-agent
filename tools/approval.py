@@ -2534,6 +2534,14 @@ def prompt_dangerous_approval(command: str, description: str,
             )
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
+            # A crashed prompt is not a refusal. Mark it so callers that can
+            # preserve the payload (memory writes → /memory pending) stage it
+            # instead of dropping it; command execution still refuses.
+            try:
+                from tools.approval_signals import mark_no_decision, TRANSPORT_ERROR
+                mark_no_decision(TRANSPORT_ERROR)
+            except Exception:
+                pass
             return "deny"
 
     # Fail-closed guard: if prompt_toolkit owns the terminal (interactive

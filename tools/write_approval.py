@@ -362,6 +362,14 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
     body = detail.strip()
     description = f"Save to memory: {header}"
     command = body if body else header
+    # Clear any stale no-decision signal before prompting: the flag is
+    # thread-local and single-shot, and a leftover from an earlier prompt on
+    # this thread must never turn the user's explicit deny into a staged write.
+    try:
+        from tools.approval_signals import clear_no_decision
+        clear_no_decision()
+    except Exception:
+        pass
     # Invoke the callback directly instead of via prompt_dangerous_approval:
     # that wrapper swallows callback exceptions into "deny", which would
     # silently refuse the write. Direct invocation lets a crashed prompt fall
@@ -375,6 +383,24 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
     if choice in {"once", "session"}:
         return True
     if choice == "deny":
+        # A deny is only a real refusal when a human chose it. The CLI returns
+        # the same "deny" string when the prompt times out (and ACP when the
+        # permission round-trip fails), so consult the out-of-band signal:
+        # no-decision → None, which stages the write instead of destroying it.
+        # Without this, a foreground memory write vanished after
+        # approvals.timeout with no store entry, no pending record and no
+        # error the user could act on (ERRATUM-11).
+        try:
+            from tools.approval_signals import consume_no_decision
+            reason = consume_no_decision()
+        except Exception:
+            reason = None
+        if reason:
+            logger.warning(
+                "Memory approval returned deny without a user decision (%s); "
+                "staging the write instead of dropping it.", reason,
+            )
+            return None
         return False
     # Any other outcome (e.g. timeout that returns "deny" already handled) →
     # treat unknown as no-decision so we stage rather than silently drop.

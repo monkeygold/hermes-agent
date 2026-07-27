@@ -28,6 +28,29 @@ _OPTION_ID_TO_HERMES = {
 
 _PERMISSION_REQUEST_IDS = count(1)
 
+# Reason codes for a deny that no human chose. Imported lazily inside the
+# helper so this module keeps working if tools/ is unavailable (probe imports).
+TIMEOUT = "timeout"
+TRANSPORT_ERROR = "transport_error"
+
+
+def _mark_no_decision(reason: str) -> None:
+    """Flag a deny as a no-decision so recoverable writes stage, not vanish.
+
+    ACP denies fall into two very different buckets: the user picked a deny
+    option (a real refusal), or the request never reached a human — the
+    permission round-trip timed out, could not be scheduled on the loop, or
+    came back empty. Both return ``"deny"``, so without this marker a memory
+    write would be destroyed by a transport hiccup with no trace (ERRATUM-11).
+    Dangerous commands are unaffected: they only read the returned string.
+    """
+    try:
+        from tools.approval_signals import mark_no_decision
+        mark_no_decision(reason)
+    except Exception:
+        pass
+
+
 
 def _permission_option_supports_kind(kind: str) -> bool:
     """Return whether the installed ACP SDK accepts a permission option kind."""
@@ -154,6 +177,7 @@ def make_approval_callback(
             log_message="Permission request: failed to schedule on loop",
         )
         if future is None:
+            _mark_no_decision(TRANSPORT_ERROR)
             return "deny"
 
         try:
@@ -161,9 +185,13 @@ def make_approval_callback(
         except (FutureTimeout, Exception) as exc:
             future.cancel()
             logger.warning("Permission request timed out or failed: %s", exc)
+            _mark_no_decision(
+                TIMEOUT if isinstance(exc, FutureTimeout) else TRANSPORT_ERROR
+            )
             return "deny"
 
         if response is None:
+            _mark_no_decision(TRANSPORT_ERROR)
             return "deny"
 
         allowed_option_ids = {option.option_id for option in options}

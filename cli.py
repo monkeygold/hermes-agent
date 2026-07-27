@@ -11883,6 +11883,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._approval_deadline = 0
             self._paint_now()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+            # Nobody actually decided. Flag the deny as a no-decision so
+            # consumers that can preserve the payload (memory writes stage
+            # into /memory pending) don't silently drop it — a timed-out
+            # prompt used to destroy the write with no trace (ERRATUM-11).
+            # Dangerous commands still refuse: they only read the return value.
+            try:
+                from tools.approval_signals import mark_no_decision, TIMEOUT
+                mark_no_decision(TIMEOUT)
+            except Exception:
+                pass
             return "deny"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,

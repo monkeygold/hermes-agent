@@ -394,6 +394,122 @@ def test_memory_inline_callback_error_stages(hermes_home, approval_callback_clea
     assert wa.pending_count("memory") == 1
 
 
+# ---------------------------------------------------------------------------
+# Timeout / no-decision fail-safe (ERRATUM-11)
+#
+# An approval callback returns the bare string "deny" both when the user
+# actively refuses AND when the prompt times out (cli.py) or the ACP
+# permission round-trip fails. Treating those identically destroyed the
+# foreground memory write: no store entry, no pending record, no error.
+# tools.approval_signals carries the missing "nobody decided" bit so a
+# no-decision stages (recoverable) while a real deny still blocks.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_decision_cleanup():
+    yield
+    from tools.approval_signals import clear_no_decision
+    clear_no_decision()
+
+
+def test_memory_inline_timeout_stages_instead_of_dropping(
+        hermes_home, approval_callback_cleanup, no_decision_cleanup):
+    """A timed-out prompt must preserve the write, not silently destroy it."""
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools.terminal_tool import set_approval_callback
+    from tools.approval_signals import mark_no_decision, TIMEOUT
+    from tools import write_approval as wa
+    _set_approval("memory", True)
+
+    # Mirrors cli.py's timeout branch: flag the no-decision, then return "deny".
+    def timeout_cb(command, description, **kw):
+        mark_no_decision(TIMEOUT)
+        return "deny"
+    set_approval_callback(timeout_cb)
+
+    store = MemoryStore(); store.load_from_disk()
+    r = json.loads(memory_tool("add", "memory", "survives timeout", store=store))
+
+    assert r["success"] is True
+    assert r.get("staged") is True
+    assert store.memory_entries == []          # not written yet — still gated
+    assert wa.pending_count("memory") == 1     # but recoverable
+
+    # The staged payload must be replayable verbatim.
+    record = wa.get_pending("memory", r["pending_id"])
+    assert record is not None
+    assert record["payload"]["content"] == "survives timeout"
+
+
+def test_memory_inline_transport_error_stages(
+        hermes_home, approval_callback_cleanup, no_decision_cleanup):
+    """An ACP permission round-trip failure stages rather than drops."""
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools.terminal_tool import set_approval_callback
+    from tools.approval_signals import mark_no_decision, TRANSPORT_ERROR
+    from tools import write_approval as wa
+    _set_approval("memory", True)
+
+    def transport_fail_cb(command, description, **kw):
+        mark_no_decision(TRANSPORT_ERROR)
+        return "deny"
+    set_approval_callback(transport_fail_cb)
+
+    store = MemoryStore(); store.load_from_disk()
+    r = json.loads(memory_tool("add", "memory", "survives transport error", store=store))
+    assert r.get("staged") is True
+    assert wa.pending_count("memory") == 1
+
+
+def test_no_decision_signal_does_not_leak_into_next_deny(
+        hermes_home, approval_callback_cleanup, no_decision_cleanup):
+    """A stale no-decision must never soften a subsequent genuine deny.
+
+    The signal is thread-local and single-shot; this is the guard that keeps
+    the gate fail-closed after a timeout on the same thread.
+    """
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools.terminal_tool import set_approval_callback
+    from tools.approval_signals import mark_no_decision, TIMEOUT
+    from tools import write_approval as wa
+    _set_approval("memory", True)
+
+    def timeout_cb(command, description, **kw):
+        mark_no_decision(TIMEOUT)
+        return "deny"
+    set_approval_callback(timeout_cb)
+
+    store = MemoryStore(); store.load_from_disk()
+    first = json.loads(memory_tool("add", "memory", "timed out", store=store))
+    assert first.get("staged") is True
+    assert wa.pending_count("memory") == 1
+
+    # Now a real user deny on the same thread: must block, not stage.
+    set_approval_callback(lambda command, description, **kw: "deny")
+    second = json.loads(memory_tool("add", "memory", "really denied", store=store))
+    assert second["success"] is False
+    assert "denied" in second["error"].lower()
+    assert store.memory_entries == []
+    assert wa.pending_count("memory") == 1  # unchanged — nothing new staged
+
+
+def test_real_deny_still_blocks_when_signal_never_set(
+        hermes_home, approval_callback_cleanup, no_decision_cleanup):
+    """Baseline: without a no-decision marker, "deny" stays a hard block."""
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools.terminal_tool import set_approval_callback
+    from tools import write_approval as wa
+    _set_approval("memory", True)
+    set_approval_callback(lambda command, description, **kw: "deny")
+
+    store = MemoryStore(); store.load_from_disk()
+    r = json.loads(memory_tool("add", "memory", "hard denied", store=store))
+    assert r["success"] is False
+    assert store.memory_entries == []
+    assert wa.pending_count("memory") == 0
+
+
+
 def test_gateway_context_stages_not_prompts(hermes_home, monkeypatch):
     # A gateway session has no per-thread CLI callback; the dangerous-command
     # /approve round-trip lives in the pending-queue machinery which the gate
