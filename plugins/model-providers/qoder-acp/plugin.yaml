@@ -1,0 +1,5 @@
+name: qoder-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Qoder CLI via a local ACP subprocess
+author: Local integration

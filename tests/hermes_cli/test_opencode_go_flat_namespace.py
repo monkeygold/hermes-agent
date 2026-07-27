@@ -30,7 +30,7 @@ from hermes_cli.model_switch import switch_model
 # Live catalog opencode-go currently returns from /v1/models (snapshot).
 _OPENCODE_GO_LIVE = [
     "minimax-m2.7", "minimax-m2.5",
-    "kimi-k2.6", "kimi-k2.5",
+    "kimi-k3", "kimi-k2.6", "kimi-k2.5",
     "glm-5.1", "glm-5",
     "deepseek-v4-pro", "deepseek-v4-flash",
     "qwen3.6-plus", "qwen3.5-plus",
@@ -157,3 +157,10 @@ def test_kimi_k2_6_stays_on_opencode_go():
     result = _run_switch("kimi-k2.6", current_model="deepseek-v4-pro")
     assert result.target_provider == "opencode-go"
     assert result.new_model == "kimi-k2.6"
+
+
+def test_kimi_k3_stays_on_opencode_go():
+    """OpenCode Go's Kimi K3 ID is distinct from the official Kimi `k3` ID."""
+    result = _run_switch("kimi-k3", current_model="kimi-k2.6")
+    assert result.target_provider == "opencode-go"
+    assert result.new_model == "kimi-k3"

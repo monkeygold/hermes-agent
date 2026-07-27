@@ -2342,6 +2342,18 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Optional per-child native Docker isolation for Hermes-routed workers.
+        # When enabled, only a narrow standard Git checkout is bind-mounted at
+        # /workspace; Qoder ACP keeps its own isolation/permission policy.
+        # auto_approve is fail-closed and becomes active only after runtime
+        # attestation confirms the dedicated container and restricted mounts.
+        "sandbox": {
+            "enabled": False,
+            "backend": "docker",
+            "image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "network": True,
+            "auto_approve": False,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

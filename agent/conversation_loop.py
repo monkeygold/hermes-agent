@@ -28,6 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.copilot_acp_client import is_acp_process_runtime
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -1355,11 +1356,7 @@ def run_conversation(
                 # returns a plain SimpleNamespace — not an iterable
                 # stream.  Mirror the ACP exclusion used for Responses
                 # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
+                elif is_acp_process_runtime(agent.provider, agent.base_url):
                     _use_streaming = False
                 # MoA streams only when a display/TTS consumer is present to
                 # receive the deltas. MoAChatCompletions.create() honors

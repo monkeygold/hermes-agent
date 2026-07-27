@@ -31,6 +31,7 @@ class TestProviderRegistry:
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
         ("copilot-acp", "GitHub Copilot ACP", "external_process"),
+        ("qoder-acp", "Qoder CLI ACP", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
@@ -49,6 +50,11 @@ class TestProviderRegistry:
         assert pconfig.name == name
         assert pconfig.auth_type == auth_type
         assert pconfig.inference_base_url  # must have a default base URL
+
+    def test_qoder_acp_is_exposed_in_the_canonical_model_picker(self):
+        from hermes_cli.models import CANONICAL_PROVIDERS
+
+        assert "qoder-acp" in {entry.slug for entry in CANONICAL_PROVIDERS}
 
     def test_zai_env_vars(self):
         pconfig = PROVIDER_REGISTRY["zai"]
@@ -160,6 +166,8 @@ PROVIDER_ENV_VARS = (
     "NOUS_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "OPENAI_BASE_URL", "HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH",
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_ACP_BASE_URL",
+    "HERMES_QODER_ACP_COMMAND", "QODER_CLI_PATH",
+    "HERMES_QODER_ACP_ARGS", "QODER_ACP_BASE_URL",
 )
 
 
@@ -404,6 +412,34 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["provider"] == "copilot-acp"
 
+    def test_qoder_acp_status_uses_its_own_command_and_args(self, monkeypatch):
+        monkeypatch.setenv("HERMES_QODER_ACP_ARGS", "--acp")
+        monkeypatch.setattr(
+            "hermes_cli.auth.shutil.which",
+            lambda command: f"/root/.local/bin/{command}",
+        )
+
+        status = get_external_process_provider_status("qoder-acp")
+
+        assert status["configured"] is True
+        assert status["command"] == "qodercli"
+        assert status["resolved_command"] == "/root/.local/bin/qodercli"
+        assert status["args"] == ["--acp"]
+        assert status["base_url"] == "acp://qoder"
+
+    def test_get_auth_status_dispatches_qoder_to_external_process(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.auth.shutil.which",
+            lambda command: f"/root/.local/bin/{command}",
+        )
+
+        status = get_auth_status("qoder-acp")
+
+        assert status["configured"] is True
+        assert status["logged_in"] is True
+        assert status["provider"] == "qoder-acp"
+        assert status["command"] == "qodercli"
+
     def test_non_api_key_provider(self):
         status = get_api_key_provider_status("nous")
         assert status["configured"] is False
@@ -510,6 +546,42 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["command"] == "/usr/local/bin/copilot"
         assert creds["args"] == ["--acp", "--stdio"]
         assert creds["source"] == "process"
+
+    def test_resolve_qoder_acp_with_local_cli(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.auth.shutil.which",
+            lambda command: f"/root/.local/bin/{command}",
+        )
+
+        creds = resolve_external_process_provider_credentials("qoder-acp")
+
+        assert creds == {
+            "provider": "qoder-acp",
+            "api_key": "qoder-acp",
+            "base_url": "acp://qoder",
+            "command": "/root/.local/bin/qodercli",
+            "args": ["--acp", "--permission-mode", "auto"],
+            "source": "process",
+        }
+
+    def test_resolve_qoder_acp_passes_target_model_to_cli(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.auth.shutil.which",
+            lambda command: f"/root/.local/bin/{command}",
+        )
+
+        creds = resolve_external_process_provider_credentials(
+            "qoder-acp",
+            target_model="Qwen3.8-Max-Preview",
+        )
+
+        assert creds["args"] == [
+            "--acp",
+            "--permission-mode",
+            "auto",
+            "--model",
+            "Qwen3.8-Max-Preview",
+        ]
 
     def test_resolve_kimi_with_key(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-secret-key")

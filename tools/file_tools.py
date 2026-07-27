@@ -996,9 +996,12 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 terminal_env = None
 
         if terminal_env is None:
-            from tools.terminal_tool import resolve_task_overrides
+            from tools.terminal_tool import (
+                resolve_task_env_config,
+                resolve_task_overrides,
+            )
 
-            config = _get_env_config()
+            config = resolve_task_env_config(raw_task_id)
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
 
@@ -1053,6 +1056,11 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
+                    "docker_env": config.get("docker_env", {}),
+                    "docker_extra_args": config.get("docker_extra_args", []),
+                    "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                    "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                    "docker_mount_host_resources": config.get("docker_mount_host_resources", True),
                 }
 
             ssh_config = None

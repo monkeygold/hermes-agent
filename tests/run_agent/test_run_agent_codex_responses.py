@@ -316,6 +316,22 @@ def test_copilot_acp_stays_on_chat_completions_for_gpt_5_models(monkeypatch):
     assert agent.api_mode == "chat_completions"
 
 
+def test_qoder_acp_stays_on_chat_completions(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="Qwen3.8-Max-Preview",
+        base_url="acp://qoder",
+        provider="qoder-acp",
+        api_key="qoder-acp",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    assert agent.provider == "qoder-acp"
+    assert agent.api_mode == "chat_completions"
+
+
 def test_custom_provider_gpt5_stays_on_chat_completions(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(

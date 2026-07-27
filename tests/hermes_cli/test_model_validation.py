@@ -429,6 +429,7 @@ class TestCopilotNormalization:
         assert opencode_model_api_mode("opencode-zen", "qwen3.6-plus") == "anthropic_messages"
 
     def test_opencode_go_api_modes_match_docs(self):
+        assert opencode_model_api_mode("opencode-go", "kimi-k3") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "glm-5.1") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "opencode-go/glm-5.1") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "glm-5") == "chat_completions"
@@ -449,6 +450,14 @@ class TestCopilotNormalization:
         assert opencode_model_api_mode("opencode-go", "kimi-k2.7-code") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "glm-5.2") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "minimax-m3") == "anthropic_messages"
+
+    def test_opencode_go_catalog_uses_provider_specific_kimi_k3_id(self):
+        model_ids = {
+            model_id
+            for model_id, _ in curated_models_for_provider("opencode-go")
+        }
+        assert "kimi-k3" in model_ids
+        assert "k3" not in model_ids
 
 
 class TestNormalizeOpencodeBaseUrl:
@@ -661,7 +670,7 @@ class TestValidateApiFallback:
     """When /models is unreachable, the validator must accept the model (with
     a warning) rather than reject it outright — otherwise provider switches
     fail in the gateway for any provider whose /models endpoint is down or
-    doesn't exist (e.g. opencode-go returns 404 HTML).
+    doesn't exist or is temporarily unavailable.
 
     Two paths:
       1. Provider has a curated catalog (``_PROVIDER_MODELS`` / live fetch):

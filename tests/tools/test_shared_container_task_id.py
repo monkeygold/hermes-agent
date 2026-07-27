@@ -151,3 +151,48 @@ def test_env_type_override_keeps_own_id():
         )
     finally:
         terminal_tool.clear_task_env_overrides("bench-env")
+
+
+def test_task_env_config_can_switch_local_parent_to_restricted_docker(monkeypatch):
+    base = {
+        "env_type": "local",
+        "docker_image": "global:image",
+        "cwd": "/host/repo",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": ["/host/extra:/extra"],
+        "docker_forward_env": ["TOKEN"],
+        "docker_env": {"TOKEN": "secret"},
+        "docker_extra_args": ["--privileged"],
+        "docker_mount_host_resources": True,
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: dict(base))
+    terminal_tool.register_task_env_overrides(
+        "sandbox-child",
+        {
+            "env_type": "docker",
+            "docker_image": "sandbox:image",
+            "cwd": "/workspace",
+            "host_cwd": "/srv/repo",
+            "docker_mount_cwd_to_workspace": True,
+            "docker_volumes": [],
+            "docker_forward_env": [],
+            "docker_env": {},
+            "docker_extra_args": [],
+            "docker_mount_host_resources": False,
+        },
+    )
+
+    config = terminal_tool.resolve_task_env_config("sandbox-child")
+
+    assert config["env_type"] == "docker"
+    assert config["docker_image"] == "sandbox:image"
+    assert config["host_cwd"] == "/srv/repo"
+    assert config["docker_mount_cwd_to_workspace"] is True
+    assert config["docker_volumes"] == []
+    assert config["docker_forward_env"] == []
+    assert config["docker_env"] == {}
+    assert config["docker_extra_args"] == []
+    assert config["docker_mount_host_resources"] is False
+    # CWD retains its separate session-aware resolution contract.
+    assert config["cwd"] == "/host/repo"

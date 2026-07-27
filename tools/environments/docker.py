@@ -5,6 +5,7 @@ configurable resource limits (CPU, memory, disk), and optional filesystem
 persistence via bind mounts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,55 @@ _DOCKER_SEARCH_PATHS = [
 
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _policy_safe_extra_args(extra_args: list[str]) -> list[str]:
+    """Keep policy-relevant Docker args without hashing environment values."""
+    safe: list[str] = []
+    redact_next_env = False
+    for arg in extra_args:
+        if redact_next_env:
+            safe.append(arg.split("=", 1)[0])
+            redact_next_env = False
+            continue
+        if arg in {"-e", "--env"}:
+            safe.append(arg)
+            redact_next_env = True
+            continue
+        if arg.startswith("--env="):
+            env_name = arg[len("--env="):].split("=", 1)[0]
+            safe.append(f"--env={env_name}")
+            continue
+        safe.append(arg)
+    return safe
+
+
+def _security_policy_fingerprint(
+    *,
+    image: str,
+    cwd: str,
+    security_args: list[str],
+    user_args: list[str],
+    writable_args: list[str],
+    resource_args: list[str],
+    volume_args: list[str],
+    extra_args: list[str],
+    mount_host_resources: bool,
+) -> str:
+    """Return a stable, non-secret fingerprint for container reuse policy."""
+    payload = {
+        "image": image,
+        "cwd": cwd,
+        "security_args": security_args,
+        "user_args": user_args,
+        "writable_args": writable_args,
+        "resource_args": resource_args,
+        "volume_args": volume_args,
+        "extra_args": _policy_safe_extra_args(extra_args),
+        "mount_host_resources": mount_host_resources,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:32]
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -91,6 +141,75 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
         normalized[key] = value
 
     return normalized
+
+
+def _append_host_resource_mounts(volume_args: list[str]) -> None:
+    """Append the standard read-only credential, skill, and cache mounts."""
+    from tools.credential_files import (
+        get_cache_directory_mounts,
+        get_credential_file_mounts,
+        get_skills_directory_mount,
+    )
+
+    for mount_entry in get_credential_file_mounts():
+        src = Path(mount_entry["host_path"])
+        if src.is_dir():
+            logger.warning(
+                "Docker: skipping credential mount — source is a directory "
+                "(likely Docker-in-Docker auto-creation): %s",
+                src,
+            )
+            continue
+        if not src.is_file():
+            logger.warning(
+                "Docker: skipping credential mount — source not found: %s", src
+            )
+            continue
+        volume_args.extend([
+            "-v",
+            f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
+        ])
+        logger.info(
+            "Docker: mounting credential %s -> %s",
+            mount_entry["host_path"],
+            mount_entry["container_path"],
+        )
+
+    for skills_mount in get_skills_directory_mount():
+        src = Path(skills_mount["host_path"])
+        if not src.is_dir():
+            logger.warning(
+                "Docker: skipping skills mount — source is not a directory: %s",
+                src,
+            )
+            continue
+        volume_args.extend([
+            "-v",
+            f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
+        ])
+        logger.info(
+            "Docker: mounting skills dir %s -> %s",
+            skills_mount["host_path"],
+            skills_mount["container_path"],
+        )
+
+    for cache_mount in get_cache_directory_mounts():
+        src = Path(cache_mount["host_path"])
+        if not src.is_dir():
+            logger.warning(
+                "Docker: skipping cache mount — source is not a directory: %s",
+                src,
+            )
+            continue
+        volume_args.extend([
+            "-v",
+            f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
+        ])
+        logger.info(
+            "Docker: mounting cache dir %s -> %s",
+            cache_mount["host_path"],
+            cache_mount["container_path"],
+        )
 
 
 def _load_hermes_env_vars() -> dict[str, str]:
@@ -596,6 +715,7 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        mount_host_resources: bool = True,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -706,85 +826,16 @@ class DockerEnvironment(BaseEnvironment):
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
 
-        # Mount credential files (OAuth tokens, etc.) declared by skills.
-        # Read-only so the container can authenticate but not modify host creds.
-        try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                get_skills_directory_mount,
-                get_cache_directory_mounts,
-            )
-
-            for mount_entry in get_credential_file_mounts():
-                src = Path(mount_entry["host_path"])
-                if src.is_dir():
-                    # Docker-in-Docker: Docker auto-created the source path as
-                    # a directory when it didn't exist on the host.  Mounting a
-                    # directory over a file destination causes exit 125.
-                    logger.warning(
-                        "Docker: skipping credential mount — source is a directory "
-                        "(likely Docker-in-Docker auto-creation): %s",
-                        src,
-                    )
-                    continue
-                if not src.is_file():
-                    logger.warning(
-                        "Docker: skipping credential mount — source not found: %s", src,
-                    )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting credential %s -> %s",
-                    mount_entry["host_path"],
-                    mount_entry["container_path"],
-                )
-
-            # Mount skill directories (local + external) so skill
-            # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
-                src = Path(skills_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping skills mount — source is not a directory: %s",
-                        src,
-                    )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting skills dir %s -> %s",
-                    skills_mount["host_path"],
-                    skills_mount["container_path"],
-                )
-
-            # Mount host-side cache directories (documents, images, audio,
-            # screenshots) so the agent can access uploaded files and other
-            # cached media from inside the container.  Read-only — the
-            # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
-                src = Path(cache_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping cache mount — source is not a directory: %s",
-                        src,
-                    )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting cache dir %s -> %s",
-                    cache_mount["host_path"],
-                    cache_mount["container_path"],
-                )
-        except Exception as e:
-            logger.debug("Docker: could not load credential file mounts: %s", e)
+        # Mount credential files, skills, and media caches for the normal shared
+        # sandbox. Restricted per-task sandboxes can disable the whole group so
+        # the repository bind mount is their only host filesystem access.
+        if not mount_host_resources:
+            logger.info("Docker: auxiliary host resource mounts disabled")
+        else:
+            try:
+                _append_host_resource_mounts(volume_args)
+            except Exception as e:
+                logger.debug("Docker: could not load credential file mounts: %s", e)
 
         # Explicit environment variables (docker_env config) — set at container
         # creation so they're available to all processes (including entrypoint).
@@ -852,6 +903,17 @@ class DockerEnvironment(BaseEnvironment):
             + env_args
             + validated_extra
         )
+        policy_fingerprint = _security_policy_fingerprint(
+            image=image,
+            cwd=cwd,
+            security_args=security_args,
+            user_args=user_args,
+            writable_args=writable_args,
+            resource_args=resource_args,
+            volume_args=volume_args,
+            extra_args=validated_extra,
+            mount_host_resources=bool(mount_host_resources),
+        )
         logger.info(f"Docker run_args: {all_run_args}")
 
         # Start the container directly via `docker run -d`.
@@ -869,17 +931,21 @@ class DockerEnvironment(BaseEnvironment):
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"hermes-policy={policy_fingerprint}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
         self._container_name = container_name
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
+        self._bound_host_cwd = host_cwd_abs if bind_host_cwd else None
+        self._mount_host_resources = bool(mount_host_resources)
 
         self._labels = {
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            "hermes-policy": policy_fingerprint,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -889,14 +955,19 @@ class DockerEnvironment(BaseEnvironment):
         # restores the documented contract; opt out via
         # ``terminal.docker_persist_across_processes: false``.
         #
-        # Reuse matches on labels only — we deliberately do NOT compare image
-        # / mounts / resources.  Operators who need a fresh container after
-        # changing those settings should set ``docker_persist_across_processes:
-        # false`` (or run ``docker rm -f`` against the labeled container) to
-        # force a clean start.
+        # Reuse requires the task/profile labels plus a deterministic policy
+        # fingerprint covering image, mounts, resources, user and security
+        # arguments. Environment values are deliberately excluded so secrets
+        # never become Docker label material. Containers created by older
+        # Hermes versions lack this label and therefore fail closed to a fresh
+        # container.
         reused = False
         if persist_across_processes:
-            existing = self._find_reusable_container(task_label, profile_name)
+            existing = self._find_reusable_container(
+                task_label,
+                profile_name,
+                policy_fingerprint,
+            )
             if existing is not None:
                 container_id, state = existing
                 # Network-mode guard: reuse must not silently defeat an
@@ -1108,7 +1179,11 @@ class DockerEnvironment(BaseEnvironment):
         # 1. Try label-based reuse (another process may have recreated it).
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
-        existing = self._find_reusable_container(task_label, profile_label)
+        existing = self._find_reusable_container(
+            task_label,
+            profile_label,
+            self._labels.get("hermes-policy", ""),
+        )
         if existing is not None:
             cid, state = existing
             if state == "running":
@@ -1267,8 +1342,13 @@ class DockerEnvironment(BaseEnvironment):
         mode = result.stdout.strip()
         return mode or None
 
-    def _find_reusable_container(self, task_label: str, profile_label: str) -> Optional[tuple[str, str]]:
-        """Look for an existing container labeled for this (task, profile).
+    def _find_reusable_container(
+        self,
+        task_label: str,
+        profile_label: str,
+        policy_fingerprint: str,
+    ) -> Optional[tuple[str, str]]:
+        """Look for an existing container matching task, profile, and policy.
 
         Returns ``(container_id, state)`` on hit, ``None`` on miss / on any
         failure (including ``docker ps`` itself failing). State is one of the
@@ -1287,6 +1367,7 @@ class DockerEnvironment(BaseEnvironment):
                     "--filter", "label=hermes-agent=1",
                     "--filter", f"label=hermes-task-id={task_label}",
                     "--filter", f"label=hermes-profile={profile_label}",
+                    "--filter", f"label=hermes-policy={policy_fingerprint}",
                     "--format", "{{.ID}}\t{{.State}}",
                 ],
                 capture_output=True,

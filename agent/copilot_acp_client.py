@@ -1,9 +1,9 @@
-"""OpenAI-compatible shim that forwards Hermes requests to `copilot --acp`.
+"""OpenAI-compatible shim that forwards Hermes requests to an ACP CLI.
 
-This adapter lets Hermes treat the GitHub Copilot ACP server as a chat-style
-backend. Each request starts a short-lived ACP session, sends the formatted
-conversation as a single prompt, collects text chunks, and converts the result
-back into the minimal shape Hermes expects from an OpenAI client.
+This adapter lets Hermes treat ACP servers such as GitHub Copilot and Qoder CLI
+as chat-style backends. Each request starts a short-lived ACP session, sends the
+formatted conversation as a single prompt, collects text chunks, and converts
+the result back into the minimal shape Hermes expects from an OpenAI client.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
+ACP_PROCESS_PROVIDERS = frozenset({"copilot-acp", "qoder-acp"})
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -72,6 +73,15 @@ def _resolve_args() -> list[str]:
     if not raw:
         return ["--acp", "--stdio"]
     return shlex.split(raw)
+
+
+def is_acp_process_runtime(provider: str | None, base_url: str | None) -> bool:
+    """Return whether a runtime should use the local ACP client facade."""
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_base = str(base_url or "").strip().lower()
+    if normalized_base.startswith("acp+tcp://"):
+        return False
+    return normalized_provider in ACP_PROCESS_PROVIDERS or normalized_base.startswith("acp://")
 
 
 def _resolve_home_dir() -> str:
@@ -394,7 +404,7 @@ class _ACPChatNamespace:
 
 
 class CopilotACPClient:
-    """Minimal OpenAI-client-compatible facade for Copilot ACP."""
+    """Minimal OpenAI-client-compatible facade for a local ACP process."""
 
     def __init__(
         self,
@@ -411,6 +421,11 @@ class CopilotACPClient:
     ):
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
+        self._backend_name = (
+            "Qoder ACP"
+            if self.api_key == "qoder-acp" or self.base_url.startswith("acp://qoder")
+            else "Copilot ACP"
+        )
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
@@ -495,7 +510,7 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or self.api_key,
         )
         if stream:
             return _completion_to_stream_chunks(completion)
@@ -515,13 +530,15 @@ class CopilotACPClient:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                f"Could not start {self._backend_name} command "
+                f"'{self._acp_command}'. Check the configured ACP command."
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(
+                f"{self._backend_name} process did not expose stdin/stdout pipes."
+            )
 
         self.is_closed = False
         with self._active_process_lock:
@@ -588,7 +605,8 @@ class CopilotACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        f"{self._backend_name} {method} failed: "
+                        f"{err.get('message') or err}"
                     )
                 return msg.get("result")
 
@@ -609,8 +627,12 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise RuntimeError(
+                    f"{self._backend_name} process exited early: {stderr_text}"
+                )
+            raise TimeoutError(
+                f"Timed out waiting for {self._backend_name} response to {method}."
+            )
 
         try:
             _request(
@@ -639,7 +661,7 @@ class CopilotACPClient:
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(f"{self._backend_name} did not return a sessionId.")
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
