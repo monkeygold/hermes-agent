@@ -634,7 +634,6 @@ DANGEROUS_PATTERNS = [
     (r'\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
-    (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (parallel to pkill -9). Catches -9 / -KILL /
@@ -1999,29 +1998,118 @@ def _is_noncanonical_verification_artifact_cleanup(command: str) -> bool:
     ) is not None
 
 
+_SYSTEMCTL_START_KEY = "system service lifecycle"
+_SYSTEMCTL_LEGACY_KEY = "stop/restart system service"
+_SYSTEMCTL_LEGACY_VERBS = {"stop", "restart", "disable", "mask"}
+_SYSTEMCTL_OPTIONS_WITH_ARG = {
+    "--boot-loader-entry", "--boot-loader-menu", "--capsule",
+    "--check-inhibitors", "--drop-in", "--host", "--image", "--image-policy",
+    "--job-mode", "--kill-subgroup", "--kill-value", "--kill-whom", "--legend",
+    "--lines", "--machine", "--message", "--output", "--preset-mode",
+    "--property", "--reboot-argument", "--root", "--runtime-scope", "--signal",
+    "--state", "--timestamp", "--type", "--unit", "--what", "--when",
+}
+_SYSTEMCTL_SHORT_OPTIONS_WITH_ARG = {
+    "-C", "-H", "-M", "-P", "-n", "-o", "-p", "-s", "-t",
+}
+
+
+def _systemctl_lifecycle_findings(command: str):
+    """Yield lifecycle categories for command-position ``systemctl`` calls.
+
+    This parser is deliberately non-executing. It uses the existing quote-aware
+    command-position lexer, skips global systemctl options (including options
+    whose argument is a separate token), and gates dynamic subcommands because
+    their runtime value cannot be proven before shell expansion.
+    """
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = _deobfuscate_shell_word_for_detection(word)
+            if os.path.basename(executable).lower() != "systemctl":
+                continue
+
+            tokens = _shell_tokens_with_spans(segment, start)
+            if tokens is None:
+                yield (_SYSTEMCTL_START_KEY, _SYSTEMCTL_START_KEY)
+                continue
+
+            args = tokens[1:]
+            index = 0
+            while index < len(args):
+                value = args[index][0]
+                if value == "--":
+                    index += 1
+                    break
+                if not value.startswith("-") or value == "-":
+                    break
+                option = value.split("=", 1)[0]
+                consumes_next = (
+                    "=" not in value
+                    and (
+                        option in _SYSTEMCTL_OPTIONS_WITH_ARG
+                        or option in _SYSTEMCTL_SHORT_OPTIONS_WITH_ARG
+                    )
+                )
+                index += 2 if consumes_next else 1
+
+            if index >= len(args):
+                continue
+
+            value, token_start, token_end, _ = args[index]
+            raw = segment[token_start:token_end]
+            if "$" in raw or "`" in raw:
+                yield (_SYSTEMCTL_START_KEY, _SYSTEMCTL_START_KEY)
+                continue
+
+            subcommand = _deobfuscate_shell_word_for_detection(value).lower()
+            if subcommand == "start":
+                yield (_SYSTEMCTL_START_KEY, _SYSTEMCTL_START_KEY)
+            elif subcommand in _SYSTEMCTL_LEGACY_VERBS:
+                yield (_SYSTEMCTL_LEGACY_KEY, _SYSTEMCTL_LEGACY_KEY)
+
+
+def detect_dangerous_commands(command: str) -> list[tuple[str, str]]:
+    """Return every distinct dangerous category present in *command*."""
+    if _command_parser_limit_exceeded(command):
+        return [(_PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)]
+    if _is_verification_artifact_cleanup(command):
+        return []
+    if _is_noncanonical_verification_artifact_cleanup(command):
+        description = "non-canonical Hermes verification artifact delete"
+        return [(description, description)]
+
+    findings: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(pattern_key: str, description: str) -> None:
+        if pattern_key not in seen:
+            seen.add(pattern_key)
+            findings.append((pattern_key, description))
+
+    for command_variant in _command_detection_variants(command):
+        for pattern_key, description in _systemctl_lifecycle_findings(command_variant):
+            add(pattern_key, description)
+        command_lower = command_variant.lower()
+        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            if pattern_re.search(command_lower):
+                add(description, description)
+
+    normalized = _normalize_command_for_detection(command)
+    for description, _ in _execution_flag_findings(normalized):
+        add(description, description)
+    return findings
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
-    if _command_parser_limit_exceeded(command):
-        return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
-    if _is_verification_artifact_cleanup(command):
-        return (False, None, None)
-    if _is_noncanonical_verification_artifact_cleanup(command):
-        description = "non-canonical Hermes verification artifact delete"
-        return (True, description, description)
-
-    for command_variant in _command_detection_variants(command):
-        command_lower = command_variant.lower()
-        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
-            if pattern_re.search(command_lower):
-                pattern_key = description
-                return (True, pattern_key, description)
-    normalized = _normalize_command_for_detection(command)
-    for description, _ in _execution_flag_findings(normalized):
-        return (True, description, description)
+    findings = detect_dangerous_commands(command)
+    if findings:
+        pattern_key, description = findings[0]
+        return (True, pattern_key, description)
     return (False, None, None)
 
 
@@ -3567,8 +3655,10 @@ def check_all_command_guards(command: str, env_type: str,
             }
         # else: tirith_fail_open is True — allow as before (tirith_result stays "allow")
 
-    # Dangerous command check (detection only, no approval)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    # Dangerous command check (detection only, no approval). Keep every
+    # category: approving one finding in a compound shell block must not mask
+    # another dangerous operation in that same block.
+    dangerous_findings = detect_dangerous_commands(command)
 
     # --- Phase 2: Decide ---
 
@@ -3589,7 +3679,7 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
-    if is_dangerous:
+    for pattern_key, description in dangerous_findings:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
