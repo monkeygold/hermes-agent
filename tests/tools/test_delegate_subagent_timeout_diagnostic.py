@@ -11,8 +11,8 @@ These tests pin:
 - the diagnostic writer's output format and content
 - the timeout branch in _run_single_child only dumps when api_calls == 0
 - the error message surfaces the diagnostic path
-- api_calls > 0 timeouts do NOT write a dump (the old "stuck on slow API
-  call" explanation still applies)
+- api_calls > 0 timeouts use the child's activity evidence instead of blaming
+  the provider or network merely because at least one API call completed
 """
 from __future__ import annotations
 
@@ -79,6 +79,60 @@ class _StubChild:
 
     def interrupt(self):
         self._hang.set()
+
+
+class _InterruptMutatesActivityChild(_StubChild):
+    """Simulate a real child whose interrupt path overwrites activity state."""
+
+    def __init__(self, **kwargs):
+        super().__init__(api_call_count=5, **kwargs)
+        self.was_interrupted = False
+
+    def get_activity_summary(self):
+        if self.was_interrupted:
+            return {
+                "api_call_count": 0,
+                "last_activity_desc": "interrupt requested",
+                "current_tool": None,
+                "seconds_since_activity": 0.0,
+            }
+        return {
+            "api_call_count": 5,
+            "last_activity_desc": "waiting for provider response (140.8s)",
+            "current_tool": None,
+            "seconds_since_activity": 0.2,
+        }
+
+    def interrupt(self):
+        self.was_interrupted = True
+        super().interrupt()
+
+
+class _InterruptMutatesZeroApiChild(_StubChild):
+    """Ensure zero-API diagnostics use the pre-interrupt activity snapshot."""
+
+    def __init__(self, **kwargs):
+        super().__init__(api_call_count=0, **kwargs)
+        self.was_interrupted = False
+
+    def get_activity_summary(self):
+        if self.was_interrupted:
+            return {
+                "api_call_count": 7,
+                "last_activity_desc": "interrupt cleanup completed",
+                "current_tool": None,
+                "seconds_since_activity": 0.0,
+            }
+        return {
+            "api_call_count": 0,
+            "last_activity_desc": "building first provider request",
+            "current_tool": None,
+            "seconds_since_activity": 30.0,
+        }
+
+    def interrupt(self):
+        self.was_interrupted = True
+        super().interrupt()
 
 
 # ── _dump_subagent_timeout_diagnostic ──────────────────────────────────
@@ -266,19 +320,129 @@ class TestRunSingleChildTimeoutDump:
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
 
-    def test_nonzero_api_calls_skips_dump_and_uses_old_message(self, hermes_home, monkeypatch):
+    def test_nonzero_api_calls_skips_dump_and_reports_unknown_idle(self, hermes_home, monkeypatch):
         child = _StubChild(api_call_count=5, hang_seconds=10.0)
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
         assert result["api_calls"] == 5
-        # No diagnostic file should be written for timeouts that made
-        # actual API calls — the old generic "stuck on slow call" message
-        # still applies.
+        # No diagnostic file should be written for timeouts that made actual
+        # API calls. The cause remains evidence-based and explicitly unknown;
+        # completed API calls alone do not prove a provider/network stall.
         assert result.get("diagnostic_path") is None
-        assert "stuck on a slow API call" in result["error"]
+        assert result["timeout_cause"] == "idle_unknown"
+        assert "provider or network failure is not established" in result["error"]
+        assert "stuck on a slow API call" not in result["error"]
         # And no subagent-timeout-* file should exist under logs/
         logs_dir = hermes_home / "logs"
         if logs_dir.is_dir():
             dumps = list(logs_dir.glob("subagent-timeout-*.log"))
             assert dumps == []
+
+    def test_timeout_snapshot_precedes_interrupt_mutation(self, hermes_home, monkeypatch):
+        child = _InterruptMutatesActivityChild(hang_seconds=10.0)
+
+        result = self._invoke_with_short_timeout(child, monkeypatch)
+
+        assert child.was_interrupted is True
+        assert result["status"] == "timeout"
+        assert result["api_calls"] == 5
+        assert result["timeout_cause"] == "provider_wait_stale"
+        assert result["timeout_activity"]["last_activity_desc"] == (
+            "waiting for provider response (140.8s)"
+        )
+        assert result["diagnostic_path"] is None
+
+    def test_zero_api_diagnostic_uses_pre_interrupt_snapshot(
+        self, hermes_home, monkeypatch
+    ):
+        child = _InterruptMutatesZeroApiChild(hang_seconds=10.0)
+
+        result = self._invoke_with_short_timeout(child, monkeypatch)
+
+        assert child.was_interrupted is True
+        assert result["api_calls"] == 0
+        assert result["diagnostic_path"] is not None
+        content = Path(result["diagnostic_path"]).read_text()
+        assert "building first provider request" in content
+        assert "interrupt cleanup completed" not in content
+
+
+class TestSubagentTimeoutClassification:
+    @pytest.mark.parametrize(
+        ("activity", "expected", "needle"),
+        [
+            (
+                {},
+                "idle_unknown",
+                "not established",
+            ),
+            (
+                {"last_activity_desc": "waiting for user approval", "seconds_since_activity": 0.2, "current_tool": "terminal"},
+                "approval_wait",
+                "approval",
+            ),
+            (
+                {"last_activity_desc": "concurrent tools running", "seconds_since_activity": 3.0, "current_tool": "read_file"},
+                "tool_active",
+                "read_file",
+            ),
+            (
+                {"last_activity_desc": "tool completed: read_file", "seconds_since_activity": 0.3, "current_tool": None},
+                "recent_activity",
+                "continued until the wall-clock limit",
+            ),
+            (
+                {"last_activity_desc": "tool completed: read_file", "seconds_since_activity": 5.0, "current_tool": None},
+                "recent_activity",
+                "continued until the wall-clock limit",
+            ),
+            (
+                {"last_activity_desc": "tool completed: read_file", "seconds_since_activity": 5.001, "current_tool": None},
+                "idle_unknown",
+                "not established",
+            ),
+            (
+                {"last_activity_desc": "waiting for non-streaming API response", "seconds_since_activity": 140.8, "current_tool": None},
+                "provider_wait_stale",
+                "provider response",
+            ),
+            (
+                {"last_activity_desc": "waiting for non-streaming API response", "seconds_since_activity": 59.999, "current_tool": None},
+                "idle_unknown",
+                "not established",
+            ),
+            (
+                {"last_activity_desc": "waiting for non-streaming API response", "seconds_since_activity": 60.0, "current_tool": None},
+                "provider_wait_stale",
+                "60.0s",
+            ),
+            (
+                {"last_activity_desc": "waiting for provider response (streaming)", "seconds_since_activity": 60.0, "current_tool": None},
+                "provider_wait_stale",
+                "60.0s",
+            ),
+            (
+                {"last_activity_desc": "waiting for non-streaming API response (140.8s)", "seconds_since_activity": 0.3, "current_tool": None},
+                "provider_wait_stale",
+                "140.8s",
+            ),
+            (
+                {"last_activity_desc": "waiting for model response (0.3s elapsed)", "seconds_since_activity": 0.3, "current_tool": None},
+                "recent_activity",
+                "continued until the wall-clock limit",
+            ),
+            (
+                {"last_activity_desc": "tool completed: search_files", "seconds_since_activity": 60.0, "current_tool": None},
+                "idle_unknown",
+                "not established",
+            ),
+        ],
+    )
+    def test_classifies_from_observed_activity(self, activity, expected, needle):
+        from tools.delegate_tool import _classify_subagent_timeout
+
+        cause, detail = _classify_subagent_timeout(activity)
+
+        assert cause == expected
+        assert needle in detail

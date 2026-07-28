@@ -55,6 +55,31 @@ delegate_task(
 
 The subagent receives a focused system prompt built from your goal and context, instructing it to complete the task and provide a structured summary of what it did, what it found, any files modified, and any issues encountered.
 
+## Bounded Review Workspaces
+
+Hermes-native delegation sandboxes require the active terminal workspace to be a narrow, writable, standard Git checkout with a real `.git/` directory. A documentation packet or arbitrary non-Git directory does not satisfy that gate. Hermes then keeps dangerous commands fail-closed instead of claiming sandbox isolation.
+
+For a review of non-Git material, stage only the exact allowed files in a temporary repository before delegating:
+
+```bash
+review_root="$(mktemp -d)"
+git -C "$review_root" init --initial-branch=review
+install -D -m 0644 /source/packet/DECISION_REGISTER.md \
+  "$review_root/packet/DECISION_REGISTER.md"
+install -D -m 0644 /source/packet/findings.json \
+  "$review_root/packet/findings.json"
+git -C "$review_root" add -- packet/DECISION_REGISTER.md packet/findings.json
+cd "$review_root"
+```
+
+Run the delegation from that terminal workspace and put the same exact file list plus the allowed targeted commands in `context`. Do not copy credentials, caches, unrelated repository contents, or broad directory trees into the review workspace. Linked Git worktrees whose `.git` is a file are intentionally rejected because their metadata lives outside the narrow mount.
+
+Review and audit prompts reserve the final part of the configured child wall-clock budget for synthesis: they request a provisional verdict by 75% and final synthesis by 85%. They also discourage full test suites, recursive scans, and test-cache creation unless explicitly required by the task.
+
+Background subagents cannot answer an approval prompt. By default, if one reaches any approval surface—including terminal/plugin guards, `execute_code`, the low-level prompt, the shared gateway-wait helper, or MCP elicitation—Hermes denies or declines immediately without notifying or waiting on the parent turn. The only exception for executable tool calls is the delegate runtime's own immediate non-interactive callback: it may approve under explicit `subagent_auto_approve` policy or after the configured Docker sandbox has been verified, but it never reopens a copied gateway/CLI approval surface. MCP elicitation always declines because it requires actual user input. Otherwise the child must report the exact blocked action so the parent can decide whether to run it through a foreground, observable approval flow.
+
+When a child reaches its hard wall-clock limit, Hermes snapshots its activity before interrupting the child or tearing down its sandbox. The result records the observed `timeout_cause`: `approval_wait`, `tool_active`, `recent_activity`, `provider_wait_stale`, or `idle_unknown`. A stale provider wait is evidence about the last visible state, not proof that the remote provider or network failed; the error also includes the last activity details used for the classification.
+
 ## Practical Examples
 
 ### Parallel Research
