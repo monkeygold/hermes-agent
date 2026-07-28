@@ -3207,6 +3207,31 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         self.assertNotIn("delegate_task", prompt)
         self.assertNotIn("Orchestrator Role", prompt)
 
+    def test_child_prompt_requires_bounded_work_and_early_synthesis(self):
+        prompt = _build_child_system_prompt(
+            "Review a packet", role="leaf", wall_clock_budget_seconds=1200
+        )
+
+        self.assertIn("75%", prompt)
+        self.assertIn("provisional verdict", prompt)
+        self.assertIn("exact file list", prompt)
+        self.assertIn("recursive scans", prompt)
+        self.assertIn("test caches", prompt)
+        self.assertIn("1200 seconds", prompt)
+        self.assertIn("900 seconds", prompt)
+        self.assertIn("1020 seconds", prompt)
+
+    def test_non_review_prompt_omits_review_audit_bounds(self):
+        prompt = _build_child_system_prompt(
+            "Implement a parser and run its targeted tests",
+            role="leaf",
+            wall_clock_budget_seconds=1200,
+        )
+
+        self.assertNotIn("REVIEW/AUDIT BOUNDS", prompt)
+        self.assertNotIn("exact file list", prompt)
+        self.assertIn("WALL-CLOCK BUDGET", prompt)
+
     def test_orchestrator_prompt_mentions_delegation_capability(self):
         prompt = _build_child_system_prompt(
             "Survey approaches", role="orchestrator",
@@ -3421,10 +3446,20 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
 
     def test_auto_approve_returns_once(self):
-        from tools.delegate_tool import _subagent_auto_approve
+        from tools.delegate_tool import (
+            _subagent_auto_approve,
+            _subagent_auto_deny,
+            _subagent_callback_can_approve,
+            _subagent_sandbox_auto_approve,
+        )
         self.assertEqual(
             _subagent_auto_approve("rm -rf /tmp/x", "dangerous"),
             "once",
+        )
+        self.assertFalse(_subagent_callback_can_approve(_subagent_auto_deny))
+        self.assertTrue(_subagent_callback_can_approve(_subagent_auto_approve))
+        self.assertTrue(
+            _subagent_callback_can_approve(_subagent_sandbox_auto_approve)
         )
 
     @patch("tools.delegate_tool._load_config", return_value={})
@@ -3492,6 +3527,45 @@ class TestSubagentApprovalCallback(unittest.TestCase):
             )
         finally:
             _subagent_sandbox_runtime.active = False
+
+    @patch(
+        "tools.tirith_security.check_command_security",
+        return_value={"action": "allow", "findings": [], "summary": ""},
+    )
+    def test_detached_verified_sandbox_keeps_noninteractive_auto_approval(
+        self, _mock_tirith
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools import approval
+        from tools.delegate_tool import (
+            _subagent_sandbox_auto_approve,
+            _subagent_sandbox_runtime,
+        )
+
+        session = "detached-sandbox-internal-callback"
+        notified = []
+        approval.register_gateway_notify(session, lambda payload: notified.append(payload))
+        session_vars = set_session_vars(platform="telegram", session_key=session)
+        session_token = approval.set_current_session_key(session)
+        wait_token = approval.set_interactive_approval_wait_allowed(False)
+        callback_token = approval.set_noninteractive_subagent_callback_allowed(True)
+        _subagent_sandbox_runtime.active = True
+        try:
+            result = approval.check_all_command_guards(
+                "rm -rf build",
+                "local",
+                approval_callback=_subagent_sandbox_auto_approve,
+            )
+        finally:
+            _subagent_sandbox_runtime.active = False
+            approval.reset_noninteractive_subagent_callback_allowed(callback_token)
+            approval.reset_interactive_approval_wait_allowed(wait_token)
+            approval.reset_current_session_key(session_token)
+            clear_session_vars(session_vars)
+            approval.unregister_gateway_notify(session)
+
+        self.assertTrue(result["approved"])
+        self.assertEqual(notified, [])
 
     def test_executor_initializer_installs_callback_in_worker(self):
         """The initializer sets the callback on the worker thread's TLS,
