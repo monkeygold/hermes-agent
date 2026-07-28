@@ -1298,12 +1298,297 @@ class TestGatewayProtection:
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 
+    @pytest.mark.parametrize("verb", ["start", "stop"])
+    def test_systemctl_service_lifecycle_flagged(self, verb):
+        """Starting or stopping any systemd unit must require approval."""
+        cmd = f"systemctl {verb} hermes-approval-probe-does-not-exist.service"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "service" in desc
+
     def test_systemctl_restart_flagged(self):
-        """systemctl restart kills running agents and should require approval."""
+        """systemctl restart keeps its historical approval category."""
         cmd = "systemctl --user restart hermes-gateway"
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is True
-        assert "stop/restart" in desc
+        assert key == "stop/restart system service"
+        assert desc == "stop/restart system service"
+
+    @pytest.mark.parametrize("verb", ["start", "stop"])
+    def test_multiline_systemctl_service_lifecycle_flagged(self, verb):
+        cmd = f"set -euo pipefail\nsystemctl \\\n  {verb} hermes-approval-probe-does-not-exist.service"
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "service" in desc
+
+    @pytest.mark.parametrize(
+        "dynamic_subcommand",
+        [
+            '"$ACTION"',
+            '"${ACTION}rt"',
+            '"$(printf start)"',
+        ],
+    )
+    def test_variable_systemctl_subcommand_flagged(self, dynamic_subcommand):
+        cmd = (
+            "ACTION=start\n"
+            f"systemctl {dynamic_subcommand} "
+            "hermes-approval-probe-does-not-exist.service"
+        )
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "service" in desc
+
+    def test_systemctl_lifecycle_wins_over_earlier_cached_rm_category(self):
+        cmd = (
+            'SENTINEL=/tmp/hermes-approval-probe-absent\n'
+            'rm -rf -- "$SENTINEL"\n'
+            'systemctl start hermes-approval-probe-does-not-exist.service'
+        )
+        dangerous, key, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert key == "system service lifecycle"
+        assert desc == "system service lifecycle"
+
+    @pytest.mark.parametrize(
+        ("approved_key", "expected_prompt_fragment"),
+        [
+            ("system service lifecycle", "recursive delete"),
+            ("recursive delete", "system service lifecycle"),
+        ],
+    )
+    def test_compound_command_checks_every_unapproved_category(
+        self, approved_key, expected_prompt_fragment, monkeypatch
+    ):
+        session_key = f"test-systemctl-compound-{approved_key}"
+        command = (
+            'SENTINEL=/tmp/hermes-approval-probe-absent\n'
+            'rm -rf -- "$SENTINEL"\n'
+            'systemctl start hermes-approval-probe-does-not-exist.service'
+        )
+        calls = []
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 1},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval_module.clear_session(session_key)
+        approval_module.approve_session(session_key, approved_key)
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            result = approval_module.check_all_command_guards(
+                command,
+                "local",
+                approval_callback=lambda *args, **kwargs: calls.append(args) or "once",
+            )
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module.clear_session(session_key)
+
+        assert result["approved"] is True
+        assert result["user_approved"] is True
+        assert len(calls) == 1
+        assert expected_prompt_fragment in calls[0][1]
+
+    @pytest.mark.parametrize(
+        ("command", "expected_key"),
+        [
+            (
+                "systemctl --root /tmp start hermes-approval-probe-does-not-exist.service",
+                "system service lifecycle",
+            ),
+            (
+                "systemctl -t service stop hermes-approval-probe-does-not-exist.service",
+                "stop/restart system service",
+            ),
+            (
+                "systemctl -P MainPID start "
+                "hermes-approval-probe-does-not-exist.service",
+                "system service lifecycle",
+            ),
+            (
+                "sudo -u root systemctl -H localhost start "
+                "hermes-approval-probe-does-not-exist.service",
+                "system service lifecycle",
+            ),
+            (
+                "env PROBE=1 systemctl stop "
+                "hermes-approval-probe-does-not-exist.service",
+                "stop/restart system service",
+            ),
+            (
+                "bash -c 'systemctl start "
+                "hermes-approval-probe-does-not-exist.service'",
+                "system service lifecycle",
+            ),
+        ],
+    )
+    def test_systemctl_options_with_separate_arguments_flagged(self, command, expected_key):
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is True
+        assert key == expected_key
+        assert desc == expected_key
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo systemctl start example.service",
+            "printf '%s\\n' 'systemctl stop example.service'",
+        ],
+    )
+    def test_systemctl_prose_not_flagged(self, command):
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+    @pytest.mark.parametrize("verb", ["start", "stop"])
+    def test_systemctl_once_prompts_again_for_next_command(self, verb, monkeypatch):
+        session_key = f"test-systemctl-once-{verb}"
+        command = f"systemctl {verb} hermes-approval-probe-does-not-exist.service"
+        calls = []
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 1},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval_module.clear_session(session_key)
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            for _ in range(2):
+                result = approval_module.check_all_command_guards(
+                    command,
+                    "local",
+                    approval_callback=lambda *args, **kwargs: calls.append(args) or "once",
+                )
+                assert result["approved"] is True
+                assert result["user_approved"] is True
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module.clear_session(session_key)
+
+        assert len(calls) == 2
+
+    def test_legacy_stop_restart_approval_does_not_authorize_start(self, monkeypatch):
+        """Widening the category must not widen an old cached decision."""
+        session_key = "test-systemctl-legacy-cache"
+        command = "systemctl start hermes-approval-probe-does-not-exist.service"
+        calls = []
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 1},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval_module.clear_session(session_key)
+        approval_module.approve_session(session_key, "stop/restart system service")
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            result = approval_module.check_all_command_guards(
+                command,
+                "local",
+                approval_callback=lambda *args, **kwargs: calls.append(args) or "once",
+            )
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module.clear_session(session_key)
+
+        assert result["approved"] is True
+        assert result["user_approved"] is True
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("verb", ["stop", "restart", "disable", "mask"])
+    def test_legacy_stop_restart_approval_still_authorizes_old_verbs(self, verb, monkeypatch):
+        session_key = f"test-systemctl-legacy-{verb}"
+        command = f"systemctl {verb} hermes-approval-probe-does-not-exist.service"
+        calls = []
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 1},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval_module.clear_session(session_key)
+        approval_module.approve_session(session_key, "stop/restart system service")
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            result = approval_module.check_all_command_guards(
+                command,
+                "local",
+                approval_callback=lambda *args, **kwargs: calls.append(args) or "once",
+            )
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module.clear_session(session_key)
+
+        assert result["approved"] is True
+        assert calls == []
+
+    def test_permanent_legacy_systemctl_key_keeps_old_scope_only(self):
+        _, stop_key, _ = detect_dangerous_command("systemctl stop example.service")
+        _, start_key, _ = detect_dangerous_command("systemctl start example.service")
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            load_permanent({"stop/restart system service"})
+            assert is_approved("legacy-systemctl-permanent", stop_key) is True
+            assert is_approved("legacy-systemctl-permanent", start_key) is False
+
+    @pytest.mark.parametrize("verb", ["start", "stop"])
+    def test_systemctl_deny_returns_blocked_without_consent(self, verb, monkeypatch):
+        session_key = f"test-systemctl-deny-{verb}"
+        command = f"systemctl {verb} hermes-approval-probe-does-not-exist.service"
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 1},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval_module.clear_session(session_key)
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            result = approval_module.check_all_command_guards(
+                command,
+                "local",
+                approval_callback=lambda *args, **kwargs: "deny",
+            )
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module.clear_session(session_key)
+
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+        assert result["user_consent"] is False
 
     def test_hermes_gateway_stop_detected(self):
         cmd = "hermes gateway stop"
