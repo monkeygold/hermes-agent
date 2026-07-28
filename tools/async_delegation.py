@@ -699,6 +699,12 @@ def dispatch_async_delegation(
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
+        from tools.approval import (
+            reset_interactive_approval_wait_allowed,
+            set_interactive_approval_wait_allowed,
+        )
+
+        approval_token = set_interactive_approval_wait_allowed(False)
         try:
             result = runner() or {}
             status = result.get("status") or "completed"
@@ -713,7 +719,10 @@ def dispatch_async_delegation(
             }
             status = "error"
         finally:
-            _finalize(delegation_id, result, status)
+            try:
+                reset_interactive_approval_wait_allowed(approval_token)
+            finally:
+                _finalize(delegation_id, result, status)
 
     try:
         # Propagate the dispatching profile so the detached child resolves
@@ -935,6 +944,12 @@ def dispatch_async_delegation_batch(
     def _worker() -> None:
         combined: Dict[str, Any] = {}
         status = "error"
+        from tools.approval import (
+            reset_interactive_approval_wait_allowed,
+            set_interactive_approval_wait_allowed,
+        )
+
+        approval_token = set_interactive_approval_wait_allowed(False)
         try:
             combined = runner() or {}
             # Batch status: completed unless every child errored/was interrupted.
@@ -955,7 +970,10 @@ def dispatch_async_delegation_batch(
             }
             status = "error"
         finally:
-            _finalize_batch(delegation_id, combined, status)
+            try:
+                reset_interactive_approval_wait_allowed(approval_token)
+            finally:
+                _finalize_batch(delegation_id, combined, status)
 
     try:
         # Propagate the dispatching profile to the detached batch children.

@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -112,6 +113,11 @@ def _get_subagent_approval_callback():
     if is_truthy_value(val):
         return _subagent_auto_approve
     return _subagent_auto_deny
+
+
+def _subagent_callback_can_approve(callback) -> bool:
+    """Whitelist internal callbacks that may authorize without a human wait."""
+    return callback is _subagent_auto_approve
 
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
@@ -730,9 +736,9 @@ _MIN_SUMMARY_CHARS = 2000
 # in via delegation.child_timeout_seconds.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
-# Stale-heartbeat thresholds. A child with no API-call progress is either:
-#   - idle between turns (no current_tool) — probably stuck on a slow API call
-#   - inside a tool (current_tool set) — probably running a legitimately long
+# Stale-heartbeat thresholds. A child with no API-call progress may be:
+#   - idle between turns (no current_tool) — cause unknown without more evidence
+#   - inside a tool (current_tool set) — potentially a legitimately long
 #     operation (terminal command, web fetch, large file read)
 # The idle ceiling stays tight so genuinely stuck children don't mask the gateway
 # timeout. The in-tool ceiling is much higher so legit long-running tools get
@@ -740,7 +746,77 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 # optional hard cap for users who want one.
 _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
+_RECENT_TIMEOUT_ACTIVITY_SECONDS = 5.0
+_PROVIDER_WAIT_STALE_SECONDS = 60.0
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+
+
+def _classify_subagent_timeout(activity: Dict[str, Any]) -> tuple[str, str]:
+    """Classify a hard timeout from observable child activity only.
+
+    The classification deliberately avoids treating ``api_call_count > 0`` as
+    proof of a provider outage. It reports the state visible at the deadline;
+    ``provider_wait_stale`` is evidence of a stale provider wait, not proof of
+    whether the remote provider, network, or local client caused it.
+    """
+    activity = activity if isinstance(activity, dict) else {}
+    desc = str(activity.get("last_activity_desc") or "unknown")
+    desc_lower = desc.lower()
+    current_tool = activity.get("current_tool")
+    seconds_observed = activity.get("seconds_since_activity") is not None
+    try:
+        seconds = float(activity.get("seconds_since_activity") or 0.0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+        seconds_observed = False
+
+    if "approval" in desc_lower and any(
+        marker in desc_lower for marker in ("wait", "request", "pending")
+    ):
+        return (
+            "approval_wait",
+            f"the child was waiting for user approval ({seconds:.1f}s since activity)",
+        )
+    if current_tool:
+        return (
+            "tool_active",
+            f"tool {current_tool!s} was still in progress ({seconds:.1f}s since activity)",
+        )
+    provider_markers = (
+        "waiting for non-streaming api response",
+        "waiting for model response",
+        "waiting for provider response",
+        "no response from provider",
+        "receiving stream response",
+        "starting api call",
+    )
+    provider_wait_visible = any(marker in desc_lower for marker in provider_markers)
+    embedded_wait = re.search(
+        r"\((\d+(?:\.\d+)?)s(?:\s+elapsed)?\)", desc_lower
+    )
+    embedded_wait_seconds = (
+        float(embedded_wait.group(1)) if embedded_wait is not None else 0.0
+    )
+    provider_wait_seconds = max(seconds, embedded_wait_seconds)
+    if provider_wait_visible and provider_wait_seconds >= _PROVIDER_WAIT_STALE_SECONDS:
+        return (
+            "provider_wait_stale",
+            "the last observed state was a stale provider response wait "
+            f"({provider_wait_seconds:.1f}s observed); the failing component is not proven",
+        )
+
+    if seconds_observed and seconds <= _RECENT_TIMEOUT_ACTIVITY_SECONDS:
+        return (
+            "recent_activity",
+            "activity continued until the wall-clock limit "
+            f"(last={desc!r}, {seconds:.1f}s earlier)",
+        )
+
+    return (
+        "idle_unknown",
+        f"no active tool or recent progress was visible (last={desc!r}, "
+        f"{seconds:.1f}s earlier); provider or network failure is not established",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +869,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    wall_clock_budget_seconds: Optional[float] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -814,6 +891,33 @@ def _build_child_system_prompt(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
+    task_text = f"{goal}\n{context or ''}".lower()
+    if any(
+        marker in task_text
+        for marker in ("review", "audit", "inspect", "verdict", "revue")
+    ):
+        parts.append(
+            "\nREVIEW/AUDIT BOUNDS:\n"
+            "Start from the exact file list and commands supplied by the parent. "
+            "Prefer targeted, cache-free checks. Do not run full test suites, "
+            "recursive scans, or commands that create test caches unless the task "
+            "explicitly requires them. If the exact scope is missing, inspect only "
+            "the smallest bounded set needed for a defensible verdict. Produce a "
+            "provisional verdict by 75% of the available budget, then stop broad "
+            "exploration and reserve the remainder for synthesis and evidence."
+        )
+
+    if wall_clock_budget_seconds is not None and wall_clock_budget_seconds > 0:
+        budget_seconds = int(wall_clock_budget_seconds)
+        provisional_seconds = int(wall_clock_budget_seconds * 0.75)
+        synthesis_seconds = int(wall_clock_budget_seconds * 0.85)
+        parts.append(
+            "\nWALL-CLOCK BUDGET:\n"
+            f"Hard limit: {budget_seconds} seconds. Emit a provisional verdict by "
+            f"{provisional_seconds} seconds (75%) and begin final synthesis by "
+            f"{synthesis_seconds} seconds. Never spend the final 15% starting a "
+            "new broad scan, full suite, or unrelated check."
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
@@ -1322,6 +1426,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        wall_clock_budget_seconds=_get_child_timeout(),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1618,6 +1723,7 @@ def _dump_subagent_timeout_diagnostic(
     duration_seconds: float,
     worker_thread: Optional[threading.Thread],
     goal: str,
+    activity_summary: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Write a structured diagnostic dump for a subagent that timed out
     before making any API call.
@@ -1718,7 +1824,11 @@ def _dump_subagent_timeout_diagnostic(
 
         _w("## Activity summary")
         try:
-            summary = child.get_activity_summary()
+            summary = (
+                activity_summary
+                if activity_summary is not None
+                else child.get_activity_summary()
+            )
             for k, v in summary.items():
                 _w(f"  {k}: {v!r}")
         except Exception as exc:
@@ -2149,6 +2259,7 @@ def _run_single_child(
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
         from tools.daemon_pool import DaemonThreadPoolExecutor
+        child_approval_callback = _get_subagent_approval_callback()
         _timeout_executor = DaemonThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -2156,7 +2267,7 @@ def _run_single_child(
             # input() and deadlock the parent's prompt_toolkit TUI.
             # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
             initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
+            initargs=(child_approval_callback,),
         )
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
@@ -2174,15 +2285,26 @@ def _run_single_child(
                 logger.debug("Child text relay failed: %s", e)
 
         def _run_with_thread_capture():
-            _worker_thread_holder["t"] = threading.current_thread()
-            from agent.delegation_context import delegated_child_context
+            from tools.approval import (
+                reset_noninteractive_subagent_callback_allowed,
+                set_noninteractive_subagent_callback_allowed,
+            )
 
-            with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+            _worker_thread_holder["t"] = threading.current_thread()
+            callback_token = set_noninteractive_subagent_callback_allowed(
+                _subagent_callback_can_approve(child_approval_callback)
+            )
+            try:
+                from agent.delegation_context import delegated_child_context
+
+                with delegated_child_context():
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+            finally:
+                reset_noninteractive_subagent_callback_allowed(callback_token)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -2192,7 +2314,29 @@ def _run_single_child(
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
+            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+
+            # Snapshot activity at the timeout boundary before interrupt() can
+            # overwrite the child's observable state.
+            child_api_calls = 0
+            activity_summary: Dict[str, Any] = {}
+            try:
+                activity_getter = getattr(child, "get_activity_summary", None)
+                raw_activity = activity_getter() if callable(activity_getter) else {}
+                activity_summary = dict(raw_activity) if isinstance(raw_activity, dict) else {}
+                child_api_calls = int(
+                    activity_summary.get("api_call_count", 0) or 0
+                )
+            except Exception:
+                activity_summary = {}
+            timeout_cause = None
+            timeout_detail = None
+            if is_timeout:
+                timeout_cause, timeout_detail = _classify_subagent_timeout(
+                    activity_summary
+                )
+
+            # Signal the child to stop only after preserving timeout evidence.
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
@@ -2201,7 +2345,6 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2214,12 +2357,6 @@ def _run_single_child(
             # diagnostic to help users (and us) see what the child was doing.
             # See #14726 — without this, 0-API-call hangs are black boxes.
             diagnostic_path: Optional[str] = None
-            child_api_calls = 0
-            try:
-                _summary = child.get_activity_summary()
-                child_api_calls = int(_summary.get("api_call_count", 0) or 0)
-            except Exception:
-                pass
             if is_timeout and child_api_calls == 0:
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
@@ -2230,6 +2367,7 @@ def _run_single_child(
                     duration_seconds=float(duration),
                     worker_thread=_worker_thread_holder.get("t"),
                     goal=goal,
+                    activity_summary=activity_summary,
                 )
                 if diagnostic_path:
                     logger.warning(
@@ -2267,9 +2405,9 @@ def _run_single_child(
                 else:
                     _err = (
                         f"Subagent timed out after {child_timeout}s with "
-                        f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call, tool call, or unresponsive "
-                        f"network request."
+                        f"{child_api_calls} API call(s) completed. "
+                        f"Timeout classification: {timeout_cause} — "
+                        f"{timeout_detail}."
                     )
                     if diagnostic_path:
                         _err += f" Diagnostic: {diagnostic_path}"
@@ -2293,6 +2431,8 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "timeout_cause": timeout_cause,
+                "timeout_activity": activity_summary if is_timeout else None,
             }
         finally:
             # Shut down executor without waiting — if the child thread

@@ -92,6 +92,364 @@ def test_dispatch_returns_immediately_without_blocking():
     gate.set()
 
 
+def test_background_delegation_approval_fails_closed_without_waiting(monkeypatch):
+    """Detached workers have no live approval turn and must never enqueue/wait."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import approval
+
+    session_key = "async-no-approval-owner"
+    notified = threading.Event()
+
+    def notify(_payload):
+        notified.set()
+        # Keep RED runs bounded: pre-fix code enters the approval wait, but this
+        # resolution releases it immediately and still proves notification was
+        # incorrectly attempted.
+        approval.resolve_gateway_approval(session_key, "once")
+
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    approval.register_gateway_notify(session_key, notify)
+    tokens = set_session_vars(platform="telegram", session_key=session_key)
+    approval_token = approval.set_current_session_key(session_key)
+
+    def runner():
+        # Mirror delegate_tool's detached-worker -> child-executor boundary.
+        from concurrent.futures import ThreadPoolExecutor
+        from tools.thread_context import propagate_context_to_thread
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                propagate_context_to_thread(
+                    lambda: approval.check_all_command_guards(
+                        "rm -rf /tmp/detached-review-output", "local"
+                    )
+                )
+            )
+            decision = future.result(timeout=5)
+        return {
+            "status": "completed",
+            "summary": json.dumps(decision),
+            "api_calls": 0,
+            "duration_seconds": 0.0,
+        }
+
+    try:
+        res = ad.dispatch_async_delegation(
+            goal="approval isolation",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key=session_key,
+            runner=runner,
+            max_async_children=1,
+        )
+        evt = _drain_for(res["delegation_id"])
+    finally:
+        approval.reset_current_session_key(approval_token)
+        clear_session_vars(tokens)
+        approval.unregister_gateway_notify(session_key)
+
+    assert evt is not None
+    decision = json.loads(evt["summary"])
+    assert decision["approved"] is False
+    assert decision["outcome"] == "background_approval_unavailable"
+    assert "detached background delegation" in decision["message"]
+    assert notified.is_set() is False
+    # The daemon worker thread is reused. Its detached marker must be restored
+    # after finalization rather than leaking into unrelated executor work.
+    restored = ad._get_executor(1).submit(
+        approval.interactive_approval_wait_allowed
+    ).result(timeout=2)
+    assert restored is True
+
+
+def test_background_batch_disables_interactive_approval_wait_context():
+    from tools import approval
+
+    def runner():
+        return {
+            "results": [
+                {
+                    "status": "completed",
+                    "summary": str(approval.interactive_approval_wait_allowed()),
+                }
+            ],
+            "total_duration_seconds": 0.0,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["batch approval isolation"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        max_async_children=1,
+    )
+    evt = _drain_for(res["delegation_id"])
+
+    assert evt is not None
+    assert evt["results"][0]["summary"] == "False"
+
+
+def test_background_delegation_without_cli_or_gateway_still_fails_closed(monkeypatch):
+    from tools import approval
+
+    for name in ("HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_INTERACTIVE"):
+        monkeypatch.delenv(name, raising=False)
+    interactive_token = approval.set_hermes_interactive_context(False)
+
+    def runner():
+        decision = approval.check_all_command_guards(
+            "rm -rf /tmp/detached-no-owner", "local"
+        )
+        return {
+            "status": "completed",
+            "summary": json.dumps(decision),
+            "api_calls": 0,
+            "duration_seconds": 0.0,
+        }
+
+    try:
+        res = ad.dispatch_async_delegation(
+            goal="no owner approval isolation",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="",
+            runner=runner,
+            max_async_children=1,
+        )
+        evt = _drain_for(res["delegation_id"])
+    finally:
+        approval.reset_hermes_interactive_context(interactive_token)
+
+    assert evt is not None
+    decision = json.loads(evt["summary"])
+    assert decision["approved"] is False
+    assert decision["outcome"] == "background_approval_unavailable"
+
+
+@pytest.mark.parametrize("bypass", ["yolo", "session_approved"])
+def test_background_delegation_preserves_explicit_approval_bypasses(
+    monkeypatch, bypass
+):
+    from tools import approval
+
+    command = "rm -rf /tmp/detached-explicit-bypass"
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+    session = f"detached-{bypass}"
+    session_token = approval.set_current_session_key(session)
+    try:
+        if bypass == "yolo":
+            monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+        else:
+            is_dangerous, pattern_key, _ = approval.detect_dangerous_command(command)
+            assert is_dangerous is True
+            assert pattern_key
+            approval.approve_session(session, pattern_key)
+
+        def runner():
+            decision = approval.check_all_command_guards(command, "local")
+            return {
+                "status": "completed",
+                "summary": json.dumps(decision),
+                "api_calls": 0,
+                "duration_seconds": 0.0,
+            }
+
+        res = ad.dispatch_async_delegation(
+            goal=f"explicit {bypass} bypass",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key=session,
+            runner=runner,
+            max_async_children=1,
+        )
+        evt = _drain_for(res["delegation_id"])
+    finally:
+        approval.reset_current_session_key(session_token)
+        approval._session_approved.pop(session, None)
+
+    assert evt is not None
+    decision = json.loads(evt["summary"])
+    assert decision["approved"] is True
+
+
+def test_foreground_approval_gate_still_uses_live_callback():
+    from tools import approval
+
+    seen = []
+    interactive_token = approval.set_hermes_interactive_context(True)
+    wait_token = approval.set_interactive_approval_wait_allowed(True)
+    try:
+        result = approval._run_approval_gate(
+            display_target="foreground target",
+            pattern_key="foreground-test-key",
+            description="foreground approval regression",
+            approval_callback=lambda *args, **kwargs: seen.append((args, kwargs)) or "once",
+            cron_deny_message="cron denied",
+            autoapprove_log_prefix="foreground regression test",
+        )
+    finally:
+        approval.reset_interactive_approval_wait_allowed(wait_token)
+        approval.reset_hermes_interactive_context(interactive_token)
+
+    assert result["approved"] is True
+    assert len(seen) == 1
+
+
+def test_detached_execute_code_guard_fails_before_smart_or_gateway(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import approval
+
+    session = "detached-execute-code"
+    notified = []
+
+    def notify(_payload):
+        notified.append(True)
+        approval.resolve_gateway_approval(session, "once")
+
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(
+        approval,
+        "_smart_approve",
+        lambda *_args, **_kwargs: pytest.fail("detached execute_code reached smart approval"),
+    )
+    approval.register_gateway_notify(session, notify)
+    session_vars = set_session_vars(platform="telegram", session_key=session)
+    session_token = approval.set_current_session_key(session)
+    wait_token = approval.set_interactive_approval_wait_allowed(False)
+    try:
+        result = approval.check_execute_code_guard("print('bounded')", "local")
+    finally:
+        approval.reset_interactive_approval_wait_allowed(wait_token)
+        approval.reset_current_session_key(session_token)
+        clear_session_vars(session_vars)
+        approval.unregister_gateway_notify(session)
+
+    assert result["approved"] is False
+    assert result["outcome"] == "background_approval_unavailable"
+    assert notified == []
+
+
+@pytest.mark.parametrize("bypass", ["yolo", "session_approved", "internal_callback"])
+def test_detached_execute_code_preserves_explicit_noninteractive_bypasses(
+    monkeypatch, bypass
+):
+    from tools import approval
+
+    session = f"detached-execute-code-{bypass}"
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    session_token = approval.set_current_session_key(session)
+    wait_token = approval.set_interactive_approval_wait_allowed(False)
+    callback_token = None
+    try:
+        if bypass == "yolo":
+            monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+        elif bypass == "session_approved":
+            approval.approve_session(session, "execute_code")
+        else:
+            callback_token = approval.set_noninteractive_subagent_callback_allowed(True)
+
+        result = approval.check_execute_code_guard("print('bounded')", "local")
+    finally:
+        if callback_token is not None:
+            approval.reset_noninteractive_subagent_callback_allowed(callback_token)
+        approval.reset_interactive_approval_wait_allowed(wait_token)
+        approval.reset_current_session_key(session_token)
+        approval._session_approved.pop(session, None)
+
+    assert result["approved"] is True
+
+
+def test_detached_mcp_elicitation_declines_without_gateway_notification():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import approval
+
+    session = "detached-mcp-elicitation"
+    notified = []
+
+    def notify(_payload):
+        notified.append(True)
+        approval.resolve_gateway_approval(session, "once")
+
+    approval.register_gateway_notify(session, notify)
+    session_vars = set_session_vars(platform="telegram", session_key=session)
+    session_token = approval.set_current_session_key(session)
+    wait_token = approval.set_interactive_approval_wait_allowed(False)
+    try:
+        result = approval.request_elicitation_consent(
+            "authorize bounded action", "requires user input"
+        )
+    finally:
+        approval.reset_interactive_approval_wait_allowed(wait_token)
+        approval.reset_current_session_key(session_token)
+        clear_session_vars(session_vars)
+        approval.unregister_gateway_notify(session)
+
+    assert result == "decline"
+    assert notified == []
+
+
+def test_detached_gateway_wait_helper_fails_before_queue_or_notification():
+    from tools import approval
+
+    notified = []
+
+    def notify(_payload):
+        notified.append(True)
+        approval.resolve_gateway_approval("detached-direct-gateway-wait", "once")
+
+    wait_token = approval.set_interactive_approval_wait_allowed(False)
+    try:
+        result = approval._await_gateway_decision(
+            "detached-direct-gateway-wait",
+            notify,
+            {
+                "command": "bounded action",
+                "description": "approval regression",
+                "pattern_key": "detached-test",
+                "pattern_keys": ["detached-test"],
+            },
+        )
+    finally:
+        approval.reset_interactive_approval_wait_allowed(wait_token)
+
+    assert result["resolved"] is False
+    assert result["outcome"] == "background_approval_unavailable"
+    assert notified == []
+    assert "detached-direct-gateway-wait" not in approval._gateway_queues
+
+
+def test_detached_low_level_prompt_denies_without_callback_or_input(monkeypatch):
+    from tools import approval
+
+    input_calls = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_args, **_kwargs: input_calls.append(True) or "deny",
+    )
+    wait_token = approval.set_interactive_approval_wait_allowed(False)
+    try:
+        result = approval.prompt_dangerous_approval(
+            "bounded action", "approval regression"
+        )
+    finally:
+        approval.reset_interactive_approval_wait_allowed(wait_token)
+
+    assert result == "deny"
+    assert input_calls == []
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 

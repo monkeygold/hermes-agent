@@ -56,6 +56,14 @@ delegate_task(
 
 The subagent receives a focused system prompt built from your goal and context, instructing it to complete the task and provide a structured summary of what it did, what it found, any files modified, and any issues encountered.
 
+## Bounded Review Execution
+
+Review and audit prompts reserve the final part of the configured child wall-clock budget for synthesis: they request a provisional verdict by 75% and final synthesis by 85%. They also discourage full test suites, recursive scans, and test-cache creation unless explicitly required by the task.
+
+Background subagents cannot answer an approval prompt. Explicit process/session bypasses—yolo or approvals mode off, plus already-established session or permanent approvals—remain authoritative. Otherwise, if a background child reaches any approval surface—including terminal/plugin guards, `execute_code`, the low-level prompt, the shared gateway-wait helper, or MCP elicitation—Hermes denies or declines immediately without notifying or waiting on the parent turn. The only non-interactive callback that may approve executable tool calls is the delegate runtime's own immediate callback under explicit `subagent_auto_approve` policy; it never reopens a copied gateway/CLI approval surface. MCP elicitation always declines because it requires actual user input. Otherwise the child must report the exact blocked action so the parent can decide whether to run it through a foreground, observable approval flow.
+
+When a child reaches its hard wall-clock limit, Hermes snapshots its activity before interrupting the child. The structured result records `timeout_cause`—`approval_wait`, `tool_active`, `recent_activity`, `provider_wait_stale`, or `idle_unknown`—and `timeout_activity`. A stale provider wait is evidence about the last visible state, not proof that the remote provider or network failed. For timeouts after one or more API calls, the human-readable error also includes the activity details used for the classification.
+
 ## Practical Examples
 
 ### Parallel Research

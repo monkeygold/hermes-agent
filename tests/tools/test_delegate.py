@@ -2970,6 +2970,31 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         self.assertNotIn("delegate_task", prompt)
         self.assertNotIn("Orchestrator Role", prompt)
 
+    def test_child_prompt_requires_bounded_work_and_early_synthesis(self):
+        prompt = _build_child_system_prompt(
+            "Review a packet", role="leaf", wall_clock_budget_seconds=1200
+        )
+
+        self.assertIn("75%", prompt)
+        self.assertIn("provisional verdict", prompt)
+        self.assertIn("exact file list", prompt)
+        self.assertIn("recursive scans", prompt)
+        self.assertIn("test caches", prompt)
+        self.assertIn("1200 seconds", prompt)
+        self.assertIn("900 seconds", prompt)
+        self.assertIn("1020 seconds", prompt)
+
+    def test_non_review_prompt_omits_review_audit_bounds(self):
+        prompt = _build_child_system_prompt(
+            "Implement a parser and run its targeted tests",
+            role="leaf",
+            wall_clock_budget_seconds=1200,
+        )
+
+        self.assertNotIn("REVIEW/AUDIT BOUNDS", prompt)
+        self.assertNotIn("exact file list", prompt)
+        self.assertIn("WALL-CLOCK BUDGET", prompt)
+
     def test_orchestrator_prompt_mentions_delegation_capability(self):
         prompt = _build_child_system_prompt(
             "Survey approaches", role="orchestrator",
@@ -3184,11 +3209,17 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
 
     def test_auto_approve_returns_once(self):
-        from tools.delegate_tool import _subagent_auto_approve
+        from tools.delegate_tool import (
+            _subagent_auto_approve,
+            _subagent_auto_deny,
+            _subagent_callback_can_approve,
+        )
         self.assertEqual(
             _subagent_auto_approve("rm -rf /tmp/x", "dangerous"),
             "once",
         )
+        self.assertFalse(_subagent_callback_can_approve(_subagent_auto_deny))
+        self.assertTrue(_subagent_callback_can_approve(_subagent_auto_approve))
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_getter_defaults_to_deny(self, _mock_cfg):
@@ -3231,6 +3262,7 @@ class TestSubagentApprovalCallback(unittest.TestCase):
             _subagent_auto_approve,
         )
         self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
+
 
     def test_executor_initializer_installs_callback_in_worker(self):
         """The initializer sets the callback on the worker thread's TLS,

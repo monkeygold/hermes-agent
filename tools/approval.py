@@ -65,6 +65,22 @@ _hermes_interactive_ctx: contextvars.ContextVar[Optional[str]] = contextvars.Con
     default=None,
 )
 
+# Detached delegation workers outlive the parent turn that created them. They
+# have no synchronous human approval surface even when copied gateway/CLI
+# context still carries a session key or callback. A ContextVar preserves this
+# restriction across nested executor boundaries without changing foreground
+# approval behavior.
+_interactive_approval_wait_allowed_ctx: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar("interactive_approval_wait_allowed", default=True)
+)
+# Detached delegate child threads always receive an internal callback that
+# returns immediately (deny by default, or approve after explicit config). This
+# separate flag lets those callbacks run without reopening a copied gateway/CLI
+# approval surface.
+_noninteractive_subagent_callback_allowed_ctx: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar("noninteractive_subagent_callback_allowed", default=False)
+)
+
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context (thread or asyncio task).
@@ -79,6 +95,63 @@ def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
 def reset_hermes_interactive_context(token: contextvars.Token) -> None:
     """Restore the prior value from :func:`set_hermes_interactive_context`."""
     _hermes_interactive_ctx.reset(token)
+
+
+def set_interactive_approval_wait_allowed(allowed: bool) -> contextvars.Token:
+    """Bind whether this execution context may block for a human decision."""
+    return _interactive_approval_wait_allowed_ctx.set(bool(allowed))
+
+
+def reset_interactive_approval_wait_allowed(token: contextvars.Token) -> None:
+    """Restore the prior detached/foreground approval-wait policy."""
+    _interactive_approval_wait_allowed_ctx.reset(token)
+
+
+def interactive_approval_wait_allowed() -> bool:
+    """Return False inside detached workers that cannot reach a live user turn."""
+    return _interactive_approval_wait_allowed_ctx.get()
+
+
+def set_noninteractive_subagent_callback_allowed(
+    allowed: bool,
+) -> contextvars.Token:
+    """Allow the delegate runtime's immediate internal callback in this context."""
+    return _noninteractive_subagent_callback_allowed_ctx.set(bool(allowed))
+
+
+def reset_noninteractive_subagent_callback_allowed(token: contextvars.Token) -> None:
+    """Restore the prior internal-callback policy."""
+    _noninteractive_subagent_callback_allowed_ctx.reset(token)
+
+
+def noninteractive_subagent_callback_allowed() -> bool:
+    """Return whether detached work may use its immediate internal callback."""
+    return _noninteractive_subagent_callback_allowed_ctx.get()
+
+
+def _background_approval_unavailable_result(
+    pattern_key: str, description: str
+) -> dict:
+    """Fail closed immediately when detached work would require consent."""
+    logger.warning(
+        "Detached background delegation blocked approval-gated action: %s (%s)",
+        pattern_key,
+        description,
+    )
+    return {
+        "approved": False,
+        "message": (
+            "BLOCKED: This action requires user approval, but a detached "
+            "background delegation has no live approval turn. It was denied "
+            "immediately without notifying or waiting for the user. Do NOT "
+            "retry it inside this delegation; report the exact blocked action "
+            "to the parent agent."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": "background_approval_unavailable",
+        "user_consent": False,
+    }
 
 
 def _is_interactive_cli() -> bool:
@@ -2416,6 +2489,19 @@ def prompt_dangerous_approval(command: str, description: str,
 
     Returns: 'once', 'session', 'always', or 'deny'
     """
+    detached_context = not interactive_approval_wait_allowed()
+    use_internal_callback = (
+        detached_context
+        and noninteractive_subagent_callback_allowed()
+        and approval_callback is not None
+    )
+    if detached_context and not use_internal_callback:
+        logger.warning(
+            "Detached background delegation denied low-level approval prompt "
+            "without opening an interactive surface"
+        )
+        return "deny"
+
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
 
@@ -2864,8 +2950,21 @@ def _run_approval_gate(
         except Exception:
             approval_callback = None
 
-    is_cli = _is_interactive_cli()
-    is_gateway = _is_gateway_approval_context()
+    detached_context = not interactive_approval_wait_allowed()
+    use_internal_callback = (
+        detached_context
+        and noninteractive_subagent_callback_allowed()
+        and approval_callback is not None
+    )
+    if detached_context and not use_internal_callback:
+        return _background_approval_unavailable_result(pattern_key, description)
+
+    # A detached delegate child must never reopen the copied owner surface.
+    # Its internal callback is synchronous and non-interactive: deny by default,
+    # or opt-in approve after explicit subagent_auto_approve configuration.
+    is_cli = _is_interactive_cli() or use_internal_callback
+    is_gateway = _is_gateway_approval_context() and not use_internal_callback
+    is_ask = env_var_enabled("HERMES_EXEC_ASK") and not use_internal_callback
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
@@ -2905,7 +3004,7 @@ def _run_approval_gate(
         )
         return {"approved": True, "message": None}
 
-    if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+    if is_gateway or is_ask:
         # Interactive gateway round-trip when a notify callback is
         # registered for this session (Discord/Telegram/Slack embed +
         # buttons, same mechanism as check_dangerous_command). Blocks the
@@ -3232,6 +3331,19 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    if not interactive_approval_wait_allowed():
+        logger.warning(
+            "Detached background delegation blocked gateway approval wait "
+            "for surface %s",
+            surface,
+        )
+        return {
+            "resolved": False,
+            "choice": "deny",
+            "outcome": "background_approval_unavailable",
+            "user_consent": False,
+        }
+
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
@@ -3392,10 +3504,23 @@ def check_all_command_guards(command: str, env_type: str,
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_detached_approval_context = not interactive_approval_wait_allowed()
+    use_internal_callback = (
+        is_detached_approval_context
+        and noninteractive_subagent_callback_allowed()
+        and approval_callback is not None
+    )
 
-    # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
-    # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    # Preserve the existing non-interactive behavior for ordinary foreground
+    # callers. Detached workers must continue through detection so a dangerous
+    # action is denied rather than silently auto-approved when no owner context
+    # propagated at all.
+    if (
+        not is_cli
+        and not is_gateway
+        and not is_ask
+        and not is_detached_approval_context
+    ):
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -3534,6 +3659,19 @@ def check_all_command_guards(command: str, env_type: str,
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
+
+    if is_detached_approval_context and not use_internal_callback:
+        combined_desc = "; ".join(desc for _, desc, _ in warnings)
+        return _background_approval_unavailable_result(
+            warnings[0][0], combined_desc
+        )
+
+    if use_internal_callback:
+        # Never route detached child work back to a copied gateway/CLI owner
+        # surface. The delegate runtime installed an immediate internal callback.
+        is_cli = True
+        is_gateway = False
+        is_ask = False
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
@@ -3867,6 +4005,23 @@ def check_execute_code_guard(code: str, env_type: str,
             }
         return {"approved": True, "message": None}
 
+    session_key = get_current_session_key()
+    # Preserve explicit session/permanent approvals before detached fail-closed.
+    if is_approved(session_key, pattern_key):
+        return {"approved": True, "message": None}
+
+    if not interactive_approval_wait_allowed():
+        # The delegate runtime sets this capability only for its whitelisted
+        # immediate auto-approve callback selected by explicit
+        # subagent_auto_approve configuration.
+        if noninteractive_subagent_callback_allowed():
+            return {
+                "approved": True,
+                "message": None,
+                "noninteractive_subagent_approved": True,
+            }
+        return _background_approval_unavailable_result(pattern_key, description)
+
     # Only gateway/ask contexts get the one-shot whole-script approval.
     #   * CLI interactive: the script's terminal() calls are guarded per-call
     #     (context now propagates into the RPC thread, #33057); a whole-script
@@ -3875,16 +4030,9 @@ def check_execute_code_guard(code: str, env_type: str,
     if not is_gateway and not is_ask:
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
-
-    # Check session/permanent approval — same gate as check_all_command_guards.
-    # Without this, "Approve session" / "Always" choices are stored but never
-    # consulted, so every execute_code call re-prompts the user (#39275).
-    if is_approved(session_key, pattern_key):
-        return {"approved": True, "message": None}
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
@@ -4065,6 +4213,13 @@ def request_elicitation_consent(
 
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
+    if not interactive_approval_wait_allowed():
+        logger.warning(
+            "Detached background delegation declined MCP elicitation without "
+            "opening an approval surface"
+        )
+        return "decline"
+
     try:
         session_key = get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive

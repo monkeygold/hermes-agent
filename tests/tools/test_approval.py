@@ -2306,9 +2306,14 @@ class TestApprovalTimeoutIsNotConsent:
         os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+        # Bind the context-local identity too. Earlier delegation tests exercise
+        # concurrent gateway ownership and may leave a different context value
+        # visible to later tests even though the process environment is reset.
+        self._approval_session_token = mod.set_current_session_key(self.SESSION_KEY)
 
     def teardown_method(self):
         from tools import approval as mod
+        mod.reset_current_session_key(self._approval_session_token)
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         for k, v in self._saved_env.items():
