@@ -424,7 +424,7 @@ class TestGeneratedSystemdUnits:
         timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT) + 30)
         return f"TimeoutStopSec={timeout}"
 
-    def test_user_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
+    def test_user_unit_marks_systemd_stop_before_sigterm_and_uses_extended_stop_timeout(self, monkeypatch):
         monkeypatch.setattr(
             gateway_cli,
             "_get_restart_drain_timeout",
@@ -433,7 +433,8 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=False)
 
         assert "ExecStart=" in unit
-        assert "ExecStop=" not in unit
+        assert "ExecStop=" in unit
+        assert "-m gateway.planned_stop $MAINPID" in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
         assert f"RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}" in unit
@@ -536,7 +537,7 @@ class TestGeneratedSystemdUnits:
 
         assert "/mnt/c/WINDOWS/system32" in unit
 
-    def test_system_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
+    def test_system_unit_marks_systemd_stop_before_sigterm_and_uses_extended_stop_timeout(self, monkeypatch):
         monkeypatch.setattr(
             gateway_cli,
             "_get_restart_drain_timeout_for_home",
@@ -545,7 +546,8 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="root")
 
         assert "ExecStart=" in unit
-        assert "ExecStop=" not in unit
+        assert "ExecStop=" in unit
+        assert "-m gateway.planned_stop $MAINPID" in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
         assert f"RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}" in unit
