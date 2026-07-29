@@ -22,6 +22,7 @@ Optional env vars:
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -64,6 +65,7 @@ _TRACE_STATE: Dict[str, TraceState] = {}
 # to bound the leak from non-finalizing turns, not to limit concurrency.
 _MAX_TRACE_STATE = 256
 _LANGFUSE_CLIENT = None
+_ATEXIT_REGISTERED = False
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
@@ -155,7 +157,7 @@ def _get_langfuse() -> Optional[Langfuse]:
     to construct a client, and every subsequent call returns that client
     (or fast-returns ``None`` if init failed).
     """
-    global _LANGFUSE_CLIENT
+    global _ATEXIT_REGISTERED, _LANGFUSE_CLIENT
     if _LANGFUSE_CLIENT is _INIT_FAILED:
         return None
     if _LANGFUSE_CLIENT is not None:
@@ -224,6 +226,10 @@ def _get_langfuse() -> Optional[Langfuse]:
         logger.warning("Could not initialize Langfuse client: %s", exc)
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
+
+    if not _ATEXIT_REGISTERED:
+        atexit.register(_shutdown_traces)
+        _ATEXIT_REGISTERED = True
 
     return _LANGFUSE_CLIENT
 
@@ -701,6 +707,51 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
         _debug(f"end observation failed: {exc}")
 
 
+def _close_root_context(state: TraceState) -> None:
+    """Exit an entered Langfuse root context exactly once."""
+    root_ctx = state.root_ctx
+    if root_ctx is None:
+        return
+    state.root_ctx = None
+    try:
+        root_ctx.__exit__(None, None, None)
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"close root context failed: {exc}")
+
+
+def _shutdown_traces() -> None:
+    """Close unfinished traces before interpreter module teardown."""
+    global _LANGFUSE_CLIENT
+
+    with _STATE_LOCK:
+        states = list(_TRACE_STATE.values())
+        _TRACE_STATE.clear()
+
+    for state in states:
+        try:
+            for observation in state.generations.values():
+                _end_observation(observation)
+            for observation in state.tools.values():
+                _end_observation(observation)
+            for queue in state.pending_tools_by_name.values():
+                for observation in queue:
+                    _end_observation(observation)
+            state.root_span.end()
+        except Exception as exc:  # pragma: no cover - best-effort at shutdown
+            _debug(f"shutdown trace failed: {exc}")
+        finally:
+            _close_root_context(state)
+
+    client = _LANGFUSE_CLIENT
+    _LANGFUSE_CLIENT = _INIT_FAILED
+    shutdown = getattr(client, "shutdown", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception as exc:  # pragma: no cover - best-effort at shutdown
+            _debug(f"shutdown Langfuse client failed: {exc}")
+
+
 def _merge_trace_output(output: Any, state: TraceState) -> Any:
     if not state.turn_tool_calls:
         return output
@@ -732,6 +783,8 @@ def _evict_stale_locked() -> None:
             state.root_span.end()
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"evict stale trace failed: {exc}")
+        finally:
+            _close_root_context(state)
 
 
 def _finish_trace(task_key: str, *, output: Any = None) -> None:
@@ -760,6 +813,7 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
+        _close_root_context(state)
         try:
             client.flush()
         except Exception:

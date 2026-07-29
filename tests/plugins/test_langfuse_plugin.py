@@ -261,13 +261,14 @@ class TestTurnTraceIsolation:
         return importlib.import_module("plugins.observability.langfuse")
 
     @staticmethod
-    def _fake_client(started):
-        """A minimal Langfuse stand-in that records each root trace opened.
+    def _fake_client(started, exited=None):
+        """A minimal Langfuse stand-in that records root context lifecycles.
 
         ``_start_root_trace`` calls ``create_trace_id`` then opens a root via
         ``start_as_current_observation(...)`` (a context manager whose
         ``__enter__`` returns the root span).  We record one entry per root
-        actually opened so the test can count distinct traces.
+        actually opened so tests can count distinct traces, and optionally
+        record each matching context exit.
         """
 
         class _Span:
@@ -288,6 +289,8 @@ class TestTurnTraceIsolation:
                 return _Span()
 
             def __exit__(self, *exc):
+                if exited is not None:
+                    exited.append(exc)
                 return False
 
         class _Client:
@@ -302,6 +305,42 @@ class TestTurnTraceIsolation:
                 pass
 
         return _Client()
+
+    def test_finalized_turn_closes_root_context(self, monkeypatch):
+        mod = self._fresh_plugin()
+        started: list = []
+        exited: list = []
+        monkeypatch.setattr(
+            mod,
+            "_get_langfuse",
+            lambda: self._fake_client(started, exited),
+        )
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        self._run_turn(mod, session="sess-close", turn_n=1, finalize=True)
+
+        assert len(started) == 1
+        assert exited == [(None, None, None)]
+
+    def test_shutdown_drains_unfinished_root_contexts(self, monkeypatch):
+        mod = self._fresh_plugin()
+        started: list = []
+        exited: list = []
+        monkeypatch.setattr(
+            mod,
+            "_get_langfuse",
+            lambda: self._fake_client(started, exited),
+        )
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        self._run_turn(mod, session="sess-shutdown", turn_n=1, finalize=False)
+        self._run_turn(mod, session="sess-shutdown", turn_n=2, finalize=False)
+        mod._shutdown_traces()
+
+        assert mod._TRACE_STATE == {}
+        assert len(exited) == 2
 
     def _run_turn(self, mod, *, session, turn_n, finalize):
         """Drive one turn through the request-scoped hooks the gateway fires."""
@@ -385,7 +424,12 @@ class TestTurnTraceIsolation:
         """
         mod = self._fresh_plugin()
         started: list = []
-        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._fake_client(started))
+        exited: list = []
+        monkeypatch.setattr(
+            mod,
+            "_get_langfuse",
+            lambda: self._fake_client(started, exited),
+        )
         monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_MAX_TRACE_STATE", 8)
         mod._TRACE_STATE.clear()
@@ -395,6 +439,7 @@ class TestTurnTraceIsolation:
             self._run_turn(mod, session="sess-leak", turn_n=n, finalize=False)
 
         assert len(mod._TRACE_STATE) <= 8
+        assert len(exited) == 42
         # The survivors are the most-recently-updated turns (LRU eviction).
         surviving = sorted(int(k.rsplit("turn", 1)[1]) for k in mod._TRACE_STATE)
         assert surviving == list(range(42, 50))
