@@ -245,7 +245,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "starlette==1.0.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
-    "tool.trace_upload": ("huggingface-hub==1.2.3",),
+    # Keep in sync with pyproject [voice]: this package is shared with
+    # faster-whisper and optional transformer stacks, so a stale lazy pin can
+    # otherwise downgrade the live environment and make `pip check` fail.
+    "tool.trace_upload": ("huggingface-hub==1.25.1",),
 }
 
 

@@ -101,6 +101,26 @@ def _exact_pins(specs):
     return pins
 
 
+def test_trace_upload_huggingface_hub_pin_matches_voice_extra():
+    """Lazy trace upload must not downgrade the shared voice/HF stack."""
+    from tools.lazy_deps import LAZY_DEPS
+
+    optional_dependencies = _load_optional_dependencies()
+    lazy_pins = _exact_pins(LAZY_DEPS["tool.trace_upload"])
+    voice_pins = _exact_pins(optional_dependencies["voice"])
+
+    assert "huggingface-hub" in lazy_pins
+    assert "huggingface-hub" in voice_pins, (
+        "[voice] must exact-pin huggingface-hub so uv.lock and the trace-upload "
+        "lazy installer resolve the same shared dependency"
+    )
+    assert lazy_pins["huggingface-hub"] == voice_pins["huggingface-hub"]
+    assert tuple(map(int, lazy_pins["huggingface-hub"].split("."))) >= (1, 5, 0), (
+        "transformers 5.x requires huggingface-hub>=1.5; an older lazy pin "
+        "silently downgrades an otherwise valid voice/embedding environment"
+    )
+
+
 def test_pyproject_aiohttp_pins_match_lazy_slack_pin():
     """Avoid update/lazy-install churn from conflicting aiohttp pins.
 
