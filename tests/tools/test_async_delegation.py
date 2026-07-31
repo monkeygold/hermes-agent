@@ -250,13 +250,12 @@ def test_background_delegation_preserves_explicit_approval_bypasses(
         if bypass == "yolo":
             monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
         else:
-            approved_keys = [
-                pattern_key
-                for pattern_key, _ in approval.detect_dangerous_commands(command)
-            ]
-            assert approved_keys
-            for pattern_key in approved_keys:
-                approval.approve_session(session, pattern_key)
+            is_dangerous, pattern_key, _description = approval.detect_dangerous_command(
+                command
+            )
+            assert is_dangerous is True
+            assert pattern_key
+            approval.approve_session(session, pattern_key)
 
         def runner():
             decision = approval.check_all_command_guards(command, "local")
