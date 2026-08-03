@@ -327,8 +327,8 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
     monkeypatch.setattr(
         A,
-        "detect_dangerous_command",
-        lambda command: (True, "owner-override-test-danger", f"risk:{command}"),
+        "detect_dangerous_commands",
+        lambda command: [("owner-override-test-danger", f"risk:{command}")],
     )
     monkeypatch.setattr(
         "tools.tirith_security.check_command_security",
@@ -382,8 +382,8 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "escalate")
     monkeypatch.setattr(
-        A, "detect_dangerous_command",
-        lambda command: (True, key, f"risk:{command}"),
+        A, "detect_dangerous_commands",
+        lambda command: [(key, f"risk:{command}")],
     )
     monkeypatch.setattr(
         "tools.tirith_security.check_command_security",
@@ -404,8 +404,8 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
     monkeypatch.setattr(
-        A, "detect_dangerous_command",
-        lambda command: (True, "pending-smart-deny", f"risk:{command}"),
+        A, "detect_dangerous_commands",
+        lambda command: [("pending-smart-deny", f"risk:{command}")],
     )
     monkeypatch.setattr(
         "tools.tirith_security.check_command_security",

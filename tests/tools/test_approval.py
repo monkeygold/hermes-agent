@@ -332,6 +332,16 @@ def _clear_session(key):
     approval_module._pending.pop(key, None)
 
 
+def _stage_operation_grant(session_key, pattern_key):
+    source = object()
+    token = approval_module._approval_operation_source.set(source)
+    try:
+        approval_module.approve_session(session_key, pattern_key)
+    finally:
+        approval_module._approval_operation_source.reset(token)
+    return source
+
+
 class TestApproveAndCheckSession:
     def test_session_approval(self):
         key = "test_session_approve"
@@ -340,6 +350,122 @@ class TestApproveAndCheckSession:
         assert is_approved(key, "rm") is False
         approve_session(key, "rm")
         assert is_approved(key, "rm") is True
+
+    def test_once_approval_is_not_reused_for_identical_command(self, monkeypatch):
+        session_key = "test-once-single-invocation"
+        command = "chmod -R 777 -- /tmp/hermes-approval-once-regression-missing"
+        prompts = []
+
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "command_allowlist": []},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        approval_module.clear_session(session_key)
+        approval_module._permanent_approved.clear()
+
+        def approve_once(_command, _description, **_kwargs):
+            prompts.append((_command, _description))
+            # The native approval round-trip currently leaks the matching key
+            # into the session cache even though the visible verdict is once.
+            approval_module.approve_session(
+                session_key, "world/other-writable permissions"
+            )
+            return "once"
+
+        first = approval_module.check_all_command_guards(
+            command, "local", approval_callback=approve_once
+        )
+        second = approval_module.check_all_command_guards(
+            command, "local", approval_callback=approve_once
+        )
+
+        assert first["approved"] is True
+        assert first["user_approved"] is True
+        assert second["approved"] is True
+        assert second["user_approved"] is True
+        assert len(prompts) == 2
+        assert is_approved(session_key, "world/other-writable permissions") is False
+
+    def test_once_consumes_matching_legacy_alias(self):
+        session_key = "test-once-legacy-alias"
+        canonical_key = "world/other-writable permissions"
+        legacy_key = next(
+            key
+            for key in approval_module._approval_key_aliases(canonical_key)
+            if key != canonical_key
+        )
+        approval_module.clear_session(session_key)
+
+        source = _stage_operation_grant(session_key, legacy_key)
+        approval_module._consume_session_approvals(
+            session_key, canonical_key, source
+        )
+
+        assert is_approved(session_key, canonical_key) is False
+
+    def test_once_does_not_remove_another_sessions_approval(self):
+        pattern_key = "world/other-writable permissions"
+        once_session = "test-once-isolated-session"
+        other_session = "test-session-grant-isolated"
+        approval_module.clear_session(once_session)
+        approval_module.clear_session(other_session)
+
+        source = _stage_operation_grant(once_session, pattern_key)
+        approval_module.approve_session(other_session, pattern_key)
+        approval_module._consume_session_approvals(
+            once_session, pattern_key, source
+        )
+
+        assert is_approved(once_session, pattern_key) is False
+        assert is_approved(other_session, pattern_key) is True
+
+    def test_once_preserves_concurrent_session_grant_for_same_key(self):
+        pattern_key = "world/other-writable permissions"
+        session_key = "test-once-concurrent-session-grant"
+        approval_module.clear_session(session_key)
+
+        # Reproduce a once surface staging its own cache entry, then race a
+        # genuine session decision for the same session and pattern.
+        source = _stage_operation_grant(session_key, pattern_key)
+        worker = threading.Thread(
+            target=approval_module.approve_session,
+            args=(session_key, pattern_key),
+        )
+        worker.start()
+        worker.join(timeout=5)
+        assert worker.is_alive() is False
+
+        approval_module._consume_session_approvals(
+            session_key, pattern_key, source
+        )
+
+        assert is_approved(session_key, pattern_key) is True
+
+    def test_once_preserves_same_thread_session_grant_for_same_key(self):
+        pattern_key = "world/other-writable permissions"
+        session_key = "test-once-same-thread-session-grant"
+        approval_module.clear_session(session_key)
+
+        source = _stage_operation_grant(session_key, pattern_key)
+        # A later independent session decision may run on the same reused
+        # worker thread; operation identity, not thread identity, separates it.
+        approval_module.approve_session(session_key, pattern_key)
+        approval_module._consume_session_approvals(
+            session_key, pattern_key, source
+        )
+
+        assert is_approved(session_key, pattern_key) is True
 
 
 class TestSessionKeyContext:

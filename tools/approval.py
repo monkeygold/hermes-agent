@@ -52,6 +52,9 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_approval_operation_source: contextvars.ContextVar[object | None] = (
+    contextvars.ContextVar("approval_operation_source", default=None)
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -2193,6 +2196,11 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
+# Track which concurrent approval flow contributed each session grant.  A
+# one-shot callback may stage a grant before returning ``once``; consuming that
+# contribution must not erase an independent ``session`` decision for the same
+# session and pattern.
+_session_approval_sources: dict[tuple[str, str], set[object]] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 _allowlist_persist_lock = threading.RLock()
@@ -2300,8 +2308,72 @@ def submit_pending(session_key: str, approval: dict):
 
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
+    source = _approval_operation_source.get()
+    if source is None:
+        # A durable session decision remains independent even when a worker
+        # thread is later reused for another approval operation.
+        source = object()
     with _lock:
-        _session_approved.setdefault(session_key, set()).add(pattern_key)
+        approved = _session_approved.setdefault(session_key, set())
+        source_key = (session_key, pattern_key)
+        if pattern_key not in approved:
+            # Reconcile metadata after legacy/direct state cleanup.
+            _session_approval_sources[source_key] = set()
+        approved.add(pattern_key)
+        _session_approval_sources.setdefault(source_key, set()).add(source)
+
+
+def _capture_approval_operation(callback):
+    """Run one owner decision with an opaque provenance token."""
+    source = object()
+    token = _approval_operation_source.set(source)
+    try:
+        return callback(), source
+    finally:
+        _approval_operation_source.reset(token)
+
+
+def _consume_session_approvals(session_key: str, pattern_keys, source=None) -> None:
+    """Remove only this flow's matching grants after a one-operation decision.
+
+    A ``once`` verdict authorizes the invocation already waiting at the prompt;
+    it must not leave a reusable pattern grant behind. Some approval surfaces
+    stage the matching key in the shared session cache while completing their
+    native round-trip, so enforce the scope boundary before returning the
+    approved invocation to the tool.
+    """
+    keys = _coerce_allowlist_patterns(pattern_keys)
+    aliases = {
+        alias
+        for key in keys
+        for alias in _approval_key_aliases(key)
+    }
+    if not aliases:
+        return
+    if source is None:
+        source = _approval_operation_source.get()
+    if source is None:
+        # Never guess which durable grant belongs to a one-shot operation.
+        return
+    with _lock:
+        approved = _session_approved.get(session_key)
+        if not approved:
+            return
+        for alias in aliases:
+            if alias not in approved:
+                continue
+            source_key = (session_key, alias)
+            sources = _session_approval_sources.get(source_key)
+            if sources is None:
+                # Unknown/legacy provenance may be a real session grant.
+                continue
+            sources.discard(source)
+            if sources:
+                continue
+            approved.discard(alias)
+            _session_approval_sources.pop(source_key, None)
+        if not approved:
+            _session_approved.pop(session_key, None)
 
 
 def enable_session_yolo(session_key: str) -> None:
@@ -2326,6 +2398,9 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        for source_key in tuple(_session_approval_sources):
+            if source_key[0] == session_key:
+                _session_approval_sources.pop(source_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
@@ -3181,8 +3256,10 @@ def _run_approval_gate(
                 "description": redact_sensitive_text(description),
                 "allow_permanent": True,
             }
-            decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+            decision, approval_source = _capture_approval_operation(
+                lambda: _await_gateway_decision(
+                    session_key, notify_cb, approval_data, surface="gateway"
+                )
             )
             if decision.get("notify_failed"):
                 return {
@@ -3218,7 +3295,9 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
-            if choice == "session":
+            if choice == "once":
+                _consume_session_approvals(session_key, pattern_key, approval_source)
+            elif choice == "session":
                 approve_session(session_key, pattern_key)
             elif choice == "always":
                 try:
@@ -3246,8 +3325,11 @@ def _run_approval_gate(
             ),
         }
 
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    choice, approval_source = _capture_approval_operation(
+        lambda: prompt_dangerous_approval(
+            display_target, description, approval_callback=approval_callback
+        )
+    )
 
     if choice == "deny":
         return {
@@ -3261,7 +3343,9 @@ def _run_approval_gate(
             "description": description,
         }
 
-    if choice == "session":
+    if choice == "once":
+        _consume_session_approvals(session_key, pattern_key, approval_source)
+    elif choice == "session":
         approve_session(session_key, pattern_key)
     elif choice == "always":
         try:
@@ -3911,8 +3995,10 @@ def check_all_command_guards(command: str, env_type: str,
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
-            decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+            decision, approval_source = _capture_approval_operation(
+                lambda: _await_gateway_decision(
+                    session_key, notify_cb, approval_data, surface="gateway"
+                )
             )
             if decision.get("notify_failed"):
                 return {
@@ -3964,9 +4050,12 @@ def check_all_command_guards(command: str, env_type: str,
                 }
 
             # A smart-DENY owner override is always one operation, even if an
-            # older client returns "session" or "always". Manual and ESCALATE
-            # choices retain their existing persistence semantics.
-            if not smart_denied_for_owner:
+            # older client returns "session" or "always". A normal ``once``
+            # decision must also consume any cache entry staged by the native
+            # approval round-trip before this invocation returns.
+            if choice == "once" or smart_denied_for_owner:
+                _consume_session_approvals(session_key, all_keys, approval_source)
+            else:
                 if choice == "session":
                     for key, _, _ in warnings:
                         approve_session(session_key, key)
@@ -4029,12 +4118,14 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key,
         surface="cli",
     )
-    choice = prompt_dangerous_approval(
-        command,
-        combined_desc,
-        allow_permanent=not has_tirith and not smart_denied_for_owner,
-        smart_denied=smart_denied_for_owner,
-        approval_callback=approval_callback,
+    choice, approval_source = _capture_approval_operation(
+        lambda: prompt_dangerous_approval(
+            command,
+            combined_desc,
+            allow_permanent=not has_tirith and not smart_denied_for_owner,
+            smart_denied=smart_denied_for_owner,
+            approval_callback=approval_callback,
+        )
     )
     _fire_approval_hook(
         "post_approval_response",
@@ -4064,9 +4155,11 @@ def check_all_command_guards(command: str, env_type: str,
             "user_consent": False,
         }
 
-    # Smart-DENY owner overrides are one-operation scoped. Preserve existing
-    # persistence for manual mode and smart ESCALATE.
-    if not smart_denied_for_owner:
+    # Smart-DENY owner overrides and normal ``once`` choices are one-operation
+    # scoped. Consume any cache entry staged by the native approval round-trip.
+    if choice == "once" or smart_denied_for_owner:
+        _consume_session_approvals(session_key, all_keys, approval_source)
+    else:
         if choice == "session":
             for key, _, _ in warnings:
                 approve_session(session_key, key)
@@ -4271,8 +4364,10 @@ def check_execute_code_guard(code: str, env_type: str,
     }
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
-    decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+    decision, approval_source = _capture_approval_operation(
+        lambda: _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway"
+        )
     )
     if decision.get("notify_failed"):
         return {
@@ -4311,9 +4406,11 @@ def check_execute_code_guard(code: str, env_type: str,
         }
 
     # Never persist a smart-DENY override under the coarse execute_code key;
-    # doing so would approve unrelated future scripts. Manual and ESCALATE
-    # decisions preserve their existing session/permanent behavior.
-    if not smart_denied_for_owner:
+    # doing so would approve unrelated future scripts. A normal ``once``
+    # decision also consumes any session entry staged during the round-trip.
+    if choice == "once" or smart_denied_for_owner:
+        _consume_session_approvals(session_key, pattern_key, approval_source)
+    else:
         if choice == "session":
             approve_session(session_key, pattern_key)
         elif choice == "always":
