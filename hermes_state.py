@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -184,14 +185,44 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_FTS_BASE_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+
+_FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+_FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
+
+# Values of HERMES_DISABLE_FTS_TRIGRAM that mean "leave trigram enabled".
+_FALSEY_ENV_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def _trigram_disabled() -> bool:
+    """True when ``HERMES_DISABLE_FTS_TRIGRAM`` opts this host out of trigram FTS.
+
+    The trigram index serves exactly one code path — the CJK branch of
+    ``search_messages()`` — and that branch already degrades to a LIKE scan
+    when the index is unavailable.  On a host with no CJK content the index is
+    pure overhead: it keeps its own inline copy of every message *plus* the
+    trigram postings, which on a large history costs more than the base FTS
+    index and the ``messages`` table combined.
+
+    Read lazily on every call rather than captured at import time.
+    ``hermes_cli.main`` loads ``~/.hermes/.env`` at startup, and several hot
+    modules import ``hermes_state`` during that same startup, so a value
+    snapshotted at import time would race the loader and silently read as
+    unset.
+    """
+    return (
+        os.getenv("HERMES_DISABLE_FTS_TRIGRAM", "").strip().lower()
+        not in _FALSEY_ENV_VALUES
+    )
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1174,12 +1205,15 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _fts_trigger_count(
+        cursor: sqlite3.Cursor,
+        triggers: Tuple[str, ...] = _FTS_TRIGGERS,
+    ) -> int:
+        placeholders = ",".join("?" for _ in triggers)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            triggers,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1628,7 +1662,11 @@ class SessionDB:
                 # v11+ code drops and rebuilds both FTS tables below, so doing
                 # the v10-only trigram backfill first only burns startup time
                 # and WAL space before v11 throws the work away.
-                if fts5_available:
+                if _trigram_disabled():
+                    # Opted out: there is no trigram index to backfill, and
+                    # nothing failed — leave fts_migrations_complete alone.
+                    pass
+                elif fts5_available:
                     _fts_trigram_exists = self._fts_table_probe(
                         cursor, "messages_fts_trigram"
                     )
@@ -1686,9 +1724,12 @@ class SessionDB:
                                 "COALESCE(tool_calls, '') "
                                 "FROM messages"
                             )
-                        trigram_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                        )
+                        if _trigram_disabled():
+                            trigram_ok = False
+                        else:
+                            trigram_ok = self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                            )
                         if trigram_ok:
                             cursor.execute(
                                 "INSERT INTO messages_fts_trigram(rowid, content) "
@@ -1901,16 +1942,32 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            trigram_off = _trigram_disabled()
+            # When trigram is disabled its three triggers are legitimately
+            # absent, so they must drop out of the expectation too. Otherwise
+            # every init reads 3 < 6, concludes the triggers are damaged, and
+            # re-runs _rebuild_fts_indexes() — a full DELETE + re-INSERT of the
+            # base FTS index over every message row, on every process start.
+            expected_triggers = _FTS_BASE_TRIGGERS if trigram_off else _FTS_TRIGGERS
+            triggers_need_repair = (
+                self._fts_trigger_count(cursor, expected_triggers)
+                < len(expected_triggers)
+            )
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
             # to the main FTS table; if it cannot be created, CJK search falls
             # back to LIKE.
             if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
+                if trigram_off:
+                    # Do not create the virtual table or its triggers: this DDL
+                    # is what would otherwise resurrect (and re-backfill) an
+                    # index an operator deliberately dropped.
+                    trigram_enabled = False
+                else:
+                    trigram_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    )
                 self._trigram_available = trigram_enabled
                 if triggers_need_repair:
                     self._rebuild_fts_indexes(
