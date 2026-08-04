@@ -718,7 +718,12 @@ _SUMMARY_HEADROOM_FRACTION = 0.5
 # already nearly full — below this we'd be truncating to noise.
 _MIN_SUMMARY_CHARS = 2000
 _DEFAULT_SUBAGENT_SANDBOX_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
-_HERMES_SANDBOX_ROUTES = frozenset({"kimi", "luna"})
+# `opencode` ajouté le 2026-08-04 (OPP-0001) : la route était la seule des trois
+# configurées à ne recevoir AUCUN bac à sable, donc aucune des garanties du
+# `docker_network: false` posé sur les deux autres. Le bac à sable est
+# l'environnement TERMINAL de l'enfant, pas son processus agent : ses appels
+# modèle passent toujours par l'hôte, seul le code qu'il EXÉCUTE perd le réseau.
+_HERMES_SANDBOX_ROUTES = frozenset({"kimi", "luna", "opencode"})
 # No default wall-clock cap on child agents: legitimate heavy subagent work
 # (deep reviews, research fan-outs, slow reasoning models) was being killed
 # mid-task. Errors should come from what the child actually does; stuck-child

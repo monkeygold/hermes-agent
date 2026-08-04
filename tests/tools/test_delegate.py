@@ -371,7 +371,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 class TestSubagentSandboxPlan(unittest.TestCase):
     @patch("tools.delegate_tool._resolve_git_workspace", return_value="/srv/repo")
-    def test_only_native_kimi_luna_routes_get_docker_plan(self, _mock_git):
+    def test_only_native_configured_routes_get_docker_plan(self, _mock_git):
         cfg = {
             "sandbox": {
                 "enabled": True,
@@ -384,6 +384,12 @@ class TestSubagentSandboxPlan(unittest.TestCase):
         self.assertEqual(luna["host_workspace"], "/srv/repo")
         self.assertEqual(luna["image"], "sandbox:test")
         self.assertFalse(luna["network"])
+        # opencode fait partie des routes natives depuis 2026-08-04 (OPP-0001) :
+        # elle était la seule des trois configurées à s'exécuter hors bac à sable.
+        opencode = _resolve_subagent_sandbox(cfg, "opencode", "/srv/repo/subdir")
+        self.assertEqual(opencode["host_workspace"], "/srv/repo")
+        self.assertFalse(opencode["network"])
+        # Cas négatif conservé : une route inconnue n'obtient toujours rien.
         self.assertIsNone(
             _resolve_subagent_sandbox(cfg, "qoder", "/srv/repo/subdir")
         )
