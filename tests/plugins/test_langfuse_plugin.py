@@ -1021,3 +1021,120 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+# ---------------------------------------------------------------------------
+# Root context lifecycle
+#
+# _start_root_trace enters the Langfuse root context manager by hand
+# (`root_ctx.__enter__()`), so every path that drops a TraceState must exit it.
+# Leaving it entered keeps the OTel context tokens attached — the turn's root
+# span stays "current" for anything else instrumented in the process — and
+# defers the generator's finalization to the GC, which at interpreter shutdown
+# surfaces as:
+#
+#   Exception ignored in: <generator object
+#       Langfuse._create_span_with_parent_context at 0x...>
+#   ...
+#     File ".../opentelemetry/trace/__init__.py", line 597, in use_span
+#       if isinstance(span, Span) and span.is_recording():
+#   TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union
+#
+# (use_span running its error handler after its own module globals have been
+# cleared, so `Span` is None). The root context is opened with
+# end_on_exit=False, so exiting it never ends the span a second time.
+# ---------------------------------------------------------------------------
+
+class TestRootContextIsExited:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    @staticmethod
+    def _state(mod, exits, *, end_raises=False):
+        """A TraceState whose root context records the __exit__ it receives."""
+
+        class _RootCM:
+            def __exit__(self, *exc):
+                exits.append(exc)
+                return False
+
+        class _Span:
+            def set_trace_io(self, **kw):
+                pass
+
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                if end_raises:
+                    raise RuntimeError("span end blew up")
+
+        return mod.TraceState(trace_id="t", root_ctx=_RootCM(), root_span=_Span())
+
+    @staticmethod
+    def _flush_only_client():
+        class _Client:
+            def flush(self):
+                pass
+
+        return _Client()
+
+    def test_finish_trace_exits_root_context(self, monkeypatch):
+        mod = self._fresh_plugin()
+        exits: list = []
+        state = self._state(mod, exits)
+        monkeypatch.setattr(mod, "_get_langfuse", self._flush_only_client)
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+        mod._TRACE_STATE["k"] = state
+
+        mod._finish_trace("k", output={"content": "done"})
+
+        assert exits == [(None, None, None)]
+        assert state.root_ctx is None
+
+    def test_root_context_exited_even_when_ending_span_fails(self, monkeypatch):
+        """The exit lives in a finally: a failure to end the span (fail-open,
+        swallowed by _finish_trace) must not strand the context."""
+        mod = self._fresh_plugin()
+        exits: list = []
+        state = self._state(mod, exits, end_raises=True)
+        monkeypatch.setattr(mod, "_get_langfuse", self._flush_only_client)
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+        mod._TRACE_STATE["k"] = state
+
+        mod._finish_trace("k")
+
+        assert exits == [(None, None, None)]
+
+    def test_evict_stale_exits_root_context(self, monkeypatch):
+        """Turns that never finalize are dropped by the cap, not by
+        _finish_trace — that path must exit the context too."""
+        mod = self._fresh_plugin()
+        exits: list = []
+        monkeypatch.setattr(mod, "_MAX_TRACE_STATE", 2)
+        mod._TRACE_STATE.clear()
+        for i in range(2):
+            state = self._state(mod, exits)
+            state.last_updated_at = float(i)
+            mod._TRACE_STATE[f"k{i}"] = state
+
+        mod._evict_stale_locked()
+
+        # Evicts down to _MAX_TRACE_STATE - 1 == 1 entry; the oldest goes.
+        assert list(mod._TRACE_STATE) == ["k1"]
+        assert exits == [(None, None, None)]
+
+    def test_close_root_ctx_is_idempotent_and_tolerates_none(self):
+        mod = self._fresh_plugin()
+        exits: list = []
+        state = self._state(mod, exits)
+
+        mod._close_root_ctx(state)
+        mod._close_root_ctx(state)
+
+        assert exits == [(None, None, None)]
+        # Every other test in this file builds TraceState with root_ctx=None.
+        mod._close_root_ctx(mod.TraceState(trace_id="t", root_ctx=None, root_span=None))

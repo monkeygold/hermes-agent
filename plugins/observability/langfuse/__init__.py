@@ -667,6 +667,29 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
 
 
+def _close_root_ctx(state: TraceState) -> None:
+    """Exit the root context manager ``_start_root_trace`` entered by hand.
+
+    Nothing else ever exits it, so without this the underlying generator is only
+    finalized by the GC: the OTel context tokens stay attached (the turn's root
+    span remains the "current" span for anything else instrumented in this
+    process), and a finalization that lands during interpreter shutdown prints an
+    ``Exception ignored in <generator ...>`` traceback from ``use_span``.
+
+    The root context is created with ``end_on_exit=False`` and the caller ends
+    the span itself, so exiting here only unwinds the context — it never ends the
+    span twice.
+    """
+    ctx = state.root_ctx
+    if ctx is None:
+        return
+    state.root_ctx = None  # idempotent: never exit the same context twice
+    try:
+        ctx.__exit__(None, None, None)
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"close root ctx failed: {exc}")
+
+
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
                              input_value: Any, metadata: Optional[dict] = None,
                              model: Optional[str] = None, model_parameters: Optional[dict] = None) -> Any:
@@ -719,7 +742,8 @@ def _evict_stale_locked() -> None:
     per-turn key would otherwise linger forever. We evict down to
     ``_MAX_TRACE_STATE - 1`` so that the about-to-be-added entry leaves the dict
     at ``_MAX_TRACE_STATE`` — a true ceiling. The evicted entry's root span is
-    ended so it is not left dangling on the Langfuse side.
+    ended so it is not left dangling on the Langfuse side, and its root context
+    is exited so it is not left attached to the OTel context.
     """
     over = len(_TRACE_STATE) - (_MAX_TRACE_STATE - 1)
     if over <= 0:
@@ -732,6 +756,7 @@ def _evict_stale_locked() -> None:
             state.root_span.end()
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"evict stale trace failed: {exc}")
+        _close_root_ctx(state)
 
 
 def _finish_trace(task_key: str, *, output: Any = None) -> None:
@@ -760,6 +785,7 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
+        _close_root_ctx(state)
         try:
             client.flush()
         except Exception:
