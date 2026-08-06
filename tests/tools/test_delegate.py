@@ -844,8 +844,27 @@ class TestDelegateTask(unittest.TestCase):
         child._subagent_id = None
         child._delegation_fallback_policy = "strict"
 
+        huge_integer = "9" * 4000
         malformed_payloads = (
-            "{broken",
+            b"\xff",
+            b"{broken",
+            (
+                '{"version":1,"entries":{"bucket":'
+                '{"code":"DELEGATION_BLOCKED_QUOTA",'
+                f'"reset_at":{huge_integer},"recorded_at":1}}}}'
+            ).encode(),
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": {
+                        "bucket": {
+                            "code": "DELEGATION_BLOCKED_QUOTA",
+                            "reset_at": time.time() + (40 * 24 * 60 * 60),
+                            "recorded_at": time.time(),
+                        }
+                    },
+                }
+            ).encode(),
             json.dumps(
                 {
                     "version": 1,
@@ -857,12 +876,12 @@ class TestDelegateTask(unittest.TestCase):
                         }
                     },
                 }
-            ),
+            ).encode(),
         )
         for payload in malformed_payloads:
             with self.subTest(payload=payload[:20]), tempfile.TemporaryDirectory() as tmp_dir:
                 circuit_path = Path(tmp_dir) / "quota-circuits.json"
-                circuit_path.write_text(payload, encoding="utf-8")
+                circuit_path.write_bytes(payload)
                 with patch(
                     "tools.delegate_tool._quota_circuit_path",
                     return_value=circuit_path,
@@ -877,6 +896,125 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
             self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_circuit_json_recursion_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-recursion"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            circuit_path.write_text('{"version":1,"entries":{}}')
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ), patch(
+                "tools.delegate_tool.json.loads",
+                side_effect=RecursionError("too deep"),
+            ):
+                result = _run_single_child(
+                    task_index=0,
+                    goal="must fail closed",
+                    child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
+        self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_circuit_permission_hardening_failure_blocks(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-permissions"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ), patch(
+                "tools.delegate_tool.os.chmod",
+                side_effect=PermissionError("denied"),
+            ):
+                result = _run_single_child(
+                    task_index=0,
+                    goal="must fail closed",
+                    child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
+        self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_legacy_quota_cache_drops_credential_before_returning(self):
+        from tools.delegate_tool import (
+            _delegation_quota_bucket,
+            _run_single_child,
+        )
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-legacy"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+        marker = "FAKE_LEGACY_SECRET"
+        now = time.time()
+        payload = {
+            "version": 1,
+            "entries": {
+                _delegation_quota_bucket(child): {
+                    "code": "DELEGATION_BLOCKED_QUOTA",
+                    "reset_at": now + 3600,
+                    "recorded_at": now,
+                    "credential": marker,
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            circuit_path.write_text(json.dumps(payload))
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ):
+                result = _run_single_child(
+                    task_index=0,
+                    goal="must fail from sanitized cache",
+                    child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+            persisted = circuit_path.read_text()
+
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA")
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertNotIn(marker, persisted)
         child.run_conversation.assert_not_called()
 
     def test_quota_file_lock_uses_msvcrt_on_windows(self):

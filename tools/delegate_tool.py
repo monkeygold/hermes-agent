@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import re
+import stat
 
 logger = logging.getLogger(__name__)
 import os
@@ -185,6 +186,18 @@ class _QuotaCircuitStateError(RuntimeError):
     """The persistent quota state cannot be trusted or updated safely."""
 
 
+def _harden_quota_path(path: Any, mode: int) -> None:
+    """Apply and verify private POSIX modes; chmod failures are fatal everywhere."""
+    try:
+        os.chmod(path, mode)
+        if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != mode:
+            raise OSError("quota state path mode verification failed")
+    except OSError as exc:
+        raise _QuotaCircuitStateError(
+            "Quota circuit path permissions cannot be secured"
+        ) from exc
+
+
 def _quota_circuit_path():
     from hermes_constants import get_hermes_home
 
@@ -195,16 +208,18 @@ def _quota_circuit_path():
 def _quota_circuit_file_lock():
     """Serialize persistent breaker updates across local Hermes processes."""
     lock_path = _quota_circuit_path().with_suffix(".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _harden_quota_path(lock_path.parent, 0o700)
     try:
-        os.chmod(lock_path.parent, 0o700)
-    except OSError:
-        pass
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        try:
-            os.chmod(lock_path, 0o600)
-        except OSError:
-            pass
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise _QuotaCircuitStateError("Quota circuit lock cannot be opened") from exc
+    try:
+        _harden_quota_path(lock_path, 0o600)
+    except Exception:
+        os.close(lock_fd)
+        raise
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as handle:
         if os.name == "nt":
             try:
                 import msvcrt
@@ -278,14 +293,16 @@ def _load_quota_circuits() -> Dict[str, Dict[str, Any]]:
         raw = path.read_text(encoding="utf-8")
         if len(raw) > _QUOTA_CIRCUIT_MAX_BYTES:
             raise _QuotaCircuitStateError("Quota circuit file exceeds size limit")
-        os.chmod(path, 0o600)
+        _harden_quota_path(path, 0o600)
     except FileNotFoundError:
         return {}
+    except UnicodeError as exc:
+        raise _QuotaCircuitStateError("Quota circuit file is not valid UTF-8") from exc
     except OSError as exc:
         raise _QuotaCircuitStateError("Quota circuit file is unreadable") from exc
     try:
         data = json.loads(raw)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         raise _QuotaCircuitStateError("Quota circuit file is invalid JSON") from exc
     entries = data.get("entries") if isinstance(data, dict) else None
     if (
@@ -301,18 +318,24 @@ def _load_quota_circuits() -> Dict[str, Dict[str, Any]]:
 
 def _save_quota_circuits(entries: Dict[str, Dict[str, Any]]) -> None:
     path = _quota_circuit_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _harden_quota_path(path.parent, 0o700)
     tmp = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.chmod(tmp, 0o600)
+        try:
+            _harden_quota_path(tmp, 0o600)
+        except Exception:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"version": 1, "entries": entries}, handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _harden_quota_path(path, 0o600)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -325,19 +348,7 @@ def _prune_quota_circuits(
 ) -> Dict[str, Dict[str, Any]]:
     current = time.time() if now is None else now
     active: Dict[str, Dict[str, Any]] = {}
-    persisted_fields = {
-        "code",
-        "provider",
-        "model",
-        "route",
-        "reset_at",
-        "retry_after",
-        "api_calls",
-        "fallback_policy",
-        "fallback_requires_approval",
-        "credential",
-        "recorded_at",
-    }
+    persisted_fields = {"code", "reset_at", "recorded_at"}
     for key, value in entries.items():
         if not isinstance(key, str) or not isinstance(value, dict):
             raise _QuotaCircuitStateError("Quota circuit entry shape is invalid")
@@ -346,14 +357,29 @@ def _prune_quota_circuits(
         if (
             isinstance(reset_at, bool)
             or not isinstance(reset_at, (int, float))
-            or not math.isfinite(float(reset_at))
             or isinstance(recorded_at, bool)
             or not isinstance(recorded_at, (int, float))
-            or not math.isfinite(float(recorded_at))
+        ):
+            raise _QuotaCircuitStateError("Quota circuit entry values are invalid")
+        try:
+            reset_number = float(reset_at)
+            recorded_number = float(recorded_at)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise _QuotaCircuitStateError(
+                "Quota circuit entry values are invalid"
+            ) from exc
+        if (
+            not math.isfinite(reset_number)
+            or not math.isfinite(recorded_number)
+            or recorded_number <= 0
+            or recorded_number > current + 300
+            or reset_number
+            > recorded_number + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS
+            or reset_number > current + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS
             or value.get("code") != "DELEGATION_BLOCKED_QUOTA"
         ):
             raise _QuotaCircuitStateError("Quota circuit entry values are invalid")
-        if float(reset_at) <= current:
+        if reset_number <= current:
             continue
         active[key] = {
             field: value[field]
@@ -384,28 +410,13 @@ def _record_delegation_quota_circuit(
             # cooldown. Provider error messages are intentionally excluded:
             # upstream exceptions can echo request headers, endpoint query
             # parameters, or other credential-bearing text.
-            persisted_fields = {
-                "code",
-                "provider",
-                "model",
-                "route",
-                "reset_at",
-                "retry_after",
-                "api_calls",
-                "fallback_policy",
-                "fallback_requires_approval",
-            }
+            persisted_fields = {"code", "reset_at"}
             entry = {
                 key: metadata[key]
                 for key in persisted_fields
                 if key in metadata
             }
             entry["reset_at"] = reset_at
-            entry["retry_after"] = min(
-                max(0.0, reset_at - now),
-                _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS,
-            )
-            entry["credential"] = _delegation_credential_bucket(child)
             entry["recorded_at"] = time.time()
             entries[_delegation_quota_bucket(child)] = entry
             _save_quota_circuits(_prune_quota_circuits(entries))
@@ -419,7 +430,20 @@ def _active_delegation_quota_circuit(child: Any) -> Optional[Dict[str, Any]]:
             if entries != raw:
                 _save_quota_circuits(entries)
             entry = entries.get(_delegation_quota_bucket(child))
-            return dict(entry) if isinstance(entry, dict) else None
+            if not isinstance(entry, dict):
+                return None
+            active = dict(entry)
+            active.update(
+                {
+                    "provider": str(getattr(child, "provider", None) or ""),
+                    "model": str(getattr(child, "model", None) or ""),
+                    "route": getattr(child, "_delegate_route", None),
+                    "fallback_policy": getattr(
+                        child, "_delegation_fallback_policy", "strict"
+                    ),
+                }
+            )
+            return active
 
 
 def _coerce_quota_seconds(value: Any) -> Optional[float]:
