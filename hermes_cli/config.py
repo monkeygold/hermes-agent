@@ -2292,6 +2292,11 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        # Provider/model fallback for delegated children:
+        # strict (default) = never fall back; ask = return an approval-required
+        # blocked result; allow = inherit the parent chain only for legacy,
+        # non-route-pinned delegation. Exact delegation.routes remain pinned.
+        "fallback_policy": "strict",
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these

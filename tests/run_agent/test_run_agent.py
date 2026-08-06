@@ -2626,6 +2626,57 @@ class TestRetryAfterCap:
         assert "Waiting 600.0s" in status
 
 
+class TestDelegationConfirmedQuotaStop:
+    def test_confirmed_weekly_quota_stops_before_retry_or_backoff(self, agent):
+        calls = 0
+
+        class _WeeklyQuotaError(Exception):
+            status_code = 429
+            response = SimpleNamespace(headers={"retry-after": "3600"})
+
+            def __str__(self):
+                return "Weekly usage limit reached; try again after reset."
+
+        def _fake_api_call(_api_kwargs):
+            nonlocal calls
+            calls += 1
+            raise _WeeklyQuotaError()
+
+        observed = []
+
+        def _quota_handler(**kwargs):
+            observed.append(kwargs)
+            return {
+                "code": "DELEGATION_BLOCKED_QUOTA",
+                "provider": "openai-codex",
+                "model": "gpt-test",
+                "route": "luna",
+                "retry_after": 3600.0,
+                "reset_at": None,
+                "api_calls": kwargs["api_call_count"],
+            }
+
+        agent.provider = "openai-codex"
+        agent.model = "gpt-test"
+        agent._delegation_quota_handler = _quota_handler
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        with patch("agent.conversation_loop.jittered_backoff") as jittered, patch(
+            "agent.conversation_loop.adaptive_rate_limit_backoff"
+        ) as adaptive:
+            result = agent.run_conversation("hello")
+
+        assert calls == 1
+        assert len(observed) == 1
+        assert result["completed"] is False
+        assert result["delegation_quota"]["code"] == "DELEGATION_BLOCKED_QUOTA"
+        assert result["api_calls"] == 1
+        jittered.assert_not_called()
+        adaptive.assert_not_called()
+
+
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 

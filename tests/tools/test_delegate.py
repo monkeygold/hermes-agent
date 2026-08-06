@@ -399,6 +399,40 @@ class TestSubagentSandboxPlan(unittest.TestCase):
         cfg = {"sandbox": {"enabled": True, "auto_approve": True}}
         self.assertIsNone(_resolve_subagent_sandbox(cfg, "kimi", "/root"))
 
+    @patch("tools.delegate_tool._resolve_git_workspace", return_value="/srv/alpha-lab")
+    @patch("run_agent.AIAgent")
+    def test_nested_sandbox_reuses_verified_parent_host_workspace(
+        self, MockAgent, mock_git
+    ):
+        parent = _make_mock_parent(depth=1)
+        parent._delegate_sandbox = {
+            "backend": "docker",
+            "host_workspace": "/srv/alpha-lab",
+            "network": False,
+        }
+        parent._delegate_sandbox_verified = True
+        parent.cwd = "/workspace"
+        MockAgent.return_value = MagicMock()
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"sandbox": {"enabled": True, "backend": "docker"}},
+        ), patch("tools.delegate_tool._get_max_spawn_depth", return_value=3):
+            child = _build_child_agent(
+                task_index=0,
+                goal="Inspect Alpha-Lab",
+                context=None,
+                toolsets=None,
+                model="test-model",
+                max_iterations=3,
+                parent_agent=parent,
+                task_count=1,
+                route="luna",
+            )
+
+        mock_git.assert_called_once_with("/srv/alpha-lab")
+        self.assertEqual(child._delegate_sandbox["host_workspace"], "/srv/alpha-lab")
+
     @patch("tools.terminal_tool.terminal_tool")
     @patch("tools.terminal_tool.get_active_env")
     def test_runtime_attestation_requires_restricted_docker(
@@ -694,6 +728,139 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(goal="Break things", parent_agent=parent))
         self.assertEqual(result["results"][0]["status"], "error")
         self.assertIn("Something broke", result["results"][0]["error"])
+
+    def test_persisted_quota_circuit_blocks_same_bucket_without_probe(self):
+        from tools.delegate_tool import (
+            _active_delegation_quota_circuit,
+            _record_delegation_quota_circuit,
+            _run_single_child,
+        )
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-a"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        _record_delegation_quota_circuit(
+            child,
+            {
+                "code": "DELEGATION_BLOCKED_QUOTA",
+                "provider": child.provider,
+                "model": child.model,
+                "route": "luna",
+                "reset_at": time.time() + 3600,
+                "retry_after": 3600.0,
+                "api_calls": 1,
+                "message": "weekly quota exhausted",
+            },
+        )
+
+        for variant in (
+            types.SimpleNamespace(
+                provider="other-provider",
+                model=child.model,
+                api_key=child.api_key,
+            ),
+            types.SimpleNamespace(
+                provider=child.provider,
+                model="other-model",
+                api_key=child.api_key,
+            ),
+            types.SimpleNamespace(
+                provider=child.provider,
+                model=child.model,
+                api_key="other-credential",
+            ),
+        ):
+            self.assertIsNone(_active_delegation_quota_circuit(variant))
+
+        result = _run_single_child(
+            task_index=0,
+            goal="must not probe",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA")
+        self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_confirmed_quota_handler_emits_observable_bucket_metadata(self):
+        from tools.delegate_tool import _build_delegation_quota_handler
+
+        child = types.SimpleNamespace(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            api_key="credential-b",
+            _delegate_route="luna",
+            _delegation_fallback_policy="ask",
+        )
+        handler = _build_delegation_quota_handler(child)
+        classified = types.SimpleNamespace(
+            reason=types.SimpleNamespace(value="rate_limit")
+        )
+
+        metadata = handler(
+            api_error=RuntimeError("provider request failed"),
+            classified=classified,
+            error_context={
+                "message": "weekly usage limit reached",
+                "reason": "insufficient_quota",
+                "reset_at": time.time() + 7200,
+            },
+            api_call_count=1,
+        )
+
+        self.assertEqual(metadata["code"], "DELEGATION_BLOCKED_QUOTA")
+        self.assertEqual(metadata["provider"], "openai-codex")
+        self.assertEqual(metadata["model"], "gpt-5.6-luna")
+        self.assertEqual(metadata["route"], "luna")
+        self.assertEqual(metadata["api_calls"], 1)
+        self.assertGreater(metadata["retry_after"], 0)
+        self.assertEqual(metadata["message"], "weekly usage limit reached")
+        self.assertTrue(metadata["fallback_requires_approval"])
+
+    def test_ask_policy_returns_approval_gate_instead_of_degraded_success(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "ask-provider"
+        child.model = "ask-model"
+        child.api_key = "ask-credential"
+        child._credential_pool = None
+        child._delegate_route = None
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "ask"
+        child._delegation_fallback_available = True
+        child.run_conversation.return_value = {
+            "final_response": "",
+            "completed": False,
+            "api_calls": 1,
+            "messages": [],
+            "error": "primary route failed",
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="ask before fallback",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["code"], "DELEGATION_BLOCKED_FALLBACK_APPROVAL"
+        )
+        self.assertTrue(result["fallback_requires_approval"])
 
     def test_depth_increments(self):
         """Verify child gets parent's depth + 1."""
@@ -3686,7 +3853,10 @@ class TestFallbackModelInheritance(unittest.TestCase):
         fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
         parent._fallback_chain = [fallback_entry]
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "allow"},
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
@@ -3702,12 +3872,86 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
 
+    def test_strict_fallback_policy_is_default_and_disables_parent_chain(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config", return_value={}
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="exact execution",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], [])
+
+    def test_ask_fallback_policy_does_not_switch_silently(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "ask"},
+        ):
+            child = _build_child_agent(
+                task_index=0,
+                goal="ask before fallback",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], [])
+        self.assertEqual(child._delegation_fallback_policy, "ask")
+
+    def test_allow_does_not_degrade_an_exact_route(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "allow"},
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="exact route gate",
+                context=None,
+                toolsets=None,
+                model="pinned-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                route="luna",
+                inherit_parent_fallback=False,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], [])
+
     def test_child_gets_no_fallback_when_parent_chain_empty(self):
         """When parent._fallback_chain is empty, fallback_model is None."""
         parent = _make_mock_parent(depth=0)
         parent._fallback_chain = []
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "allow"},
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
