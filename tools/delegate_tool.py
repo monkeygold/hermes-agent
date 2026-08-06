@@ -186,6 +186,10 @@ def _quota_circuit_file_lock():
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
         try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        try:
             import fcntl
         except ImportError:  # pragma: no cover - Windows uses the process lock
             yield
@@ -238,10 +242,11 @@ def _save_quota_circuits(entries: Dict[str, Dict[str, Any]]) -> None:
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
     try:
-        tmp.write_text(
-            json.dumps({"version": 1, "entries": entries}, sort_keys=True),
-            encoding="utf-8",
-        )
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "entries": entries}, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     finally:
         try:
@@ -280,7 +285,26 @@ def _record_delegation_quota_circuit(
     with _quota_circuit_lock:
         with _quota_circuit_file_lock():
             entries = _prune_quota_circuits(_load_quota_circuits())
-            entry = dict(metadata)
+            # Persist only the fields needed to enforce and explain the
+            # cooldown. Provider error messages are intentionally excluded:
+            # upstream exceptions can echo request headers, endpoint query
+            # parameters, or other credential-bearing text.
+            persisted_fields = {
+                "code",
+                "provider",
+                "model",
+                "route",
+                "reset_at",
+                "retry_after",
+                "api_calls",
+                "fallback_policy",
+                "fallback_requires_approval",
+            }
+            entry = {
+                key: metadata[key]
+                for key in persisted_fields
+                if key in metadata
+            }
             entry["credential"] = _delegation_credential_bucket(child)
             entry["recorded_at"] = time.time()
             entries[_delegation_quota_bucket(child)] = entry

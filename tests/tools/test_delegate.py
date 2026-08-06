@@ -11,6 +11,9 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+from pathlib import Path
+import stat
+import tempfile
 import threading
 import time
 import types
@@ -791,6 +794,40 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA")
         self.assertEqual(result["api_calls"], 0)
         child.run_conversation.assert_not_called()
+
+    def test_quota_circuit_cache_is_private_and_omits_raw_error_message(self):
+        from tools.delegate_tool import _record_delegation_quota_circuit
+
+        child = types.SimpleNamespace(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            api_key="credential-secret",
+        )
+        marker = "FAKE_SECRET_MARKER_DO_NOT_PERSIST"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ):
+                _record_delegation_quota_circuit(
+                    child,
+                    {
+                        "code": "DELEGATION_BLOCKED_QUOTA",
+                        "provider": child.provider,
+                        "model": child.model,
+                        "reset_at": time.time() + 3600,
+                        "retry_after": 3600.0,
+                        "api_calls": 1,
+                        "message": f"weekly quota exhausted: {marker}",
+                    },
+                )
+
+            persisted = circuit_path.read_text(encoding="utf-8")
+            self.assertNotIn(marker, persisted)
+            self.assertNotIn("credential-secret", persisted)
+            self.assertEqual(stat.S_IMODE(circuit_path.stat().st_mode), 0o600)
 
     def test_confirmed_quota_handler_emits_observable_bucket_metadata(self):
         from tools.delegate_tool import _build_delegation_quota_handler
