@@ -20,6 +20,7 @@ import enum
 import hashlib
 import json
 import logging
+import math
 import re
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
@@ -170,7 +172,17 @@ _DELEGATION_ROUTES = frozenset(_DELEGATION_ROUTE_CHOICES)
 _UNSET = object()
 
 _QUOTA_CIRCUIT_MAX_ENTRIES = 256
+_QUOTA_CIRCUIT_MAX_RAW_ENTRIES = 1024
+_QUOTA_CIRCUIT_MAX_BYTES = 1_048_576
+# Weekly/monthly provider limits need a long-lived breaker, but malformed
+# headers must never create a permanent bucket. One calendar month is the
+# finite upper bound for a single observed cooldown.
+_QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS = 31 * 24 * 60 * 60
 _quota_circuit_lock = threading.RLock()
+
+
+class _QuotaCircuitStateError(RuntimeError):
+    """The persistent quota state cannot be trusted or updated safely."""
 
 
 def _quota_circuit_path():
@@ -184,21 +196,54 @@ def _quota_circuit_file_lock():
     """Serialize persistent breaker updates across local Hermes processes."""
     lock_path = _quota_circuit_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(lock_path.parent, 0o700)
+    except OSError:
+        pass
     with lock_path.open("a+", encoding="utf-8") as handle:
         try:
             os.chmod(lock_path, 0o600)
         except OSError:
             pass
+        if os.name == "nt":
+            try:
+                import msvcrt
+            except ImportError as exc:  # pragma: no cover - defensive
+                raise _QuotaCircuitStateError(
+                    "Windows quota circuit locking is unavailable"
+                ) from exc
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError as exc:
+                raise _QuotaCircuitStateError(
+                    "Windows quota circuit locking failed"
+                ) from exc
+            return
+
         try:
             import fcntl
-        except ImportError:  # pragma: no cover - Windows uses the process lock
-            yield
-            return
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except ImportError as exc:  # pragma: no cover - unsupported POSIX
+            raise _QuotaCircuitStateError(
+                "Quota circuit locking is unavailable"
+            ) from exc
         try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise _QuotaCircuitStateError("Quota circuit locking failed") from exc
 
 
 def _delegation_credential_bucket(child: Any) -> str:
@@ -228,11 +273,30 @@ def _delegation_quota_bucket(child: Any) -> str:
 def _load_quota_circuits() -> Dict[str, Dict[str, Any]]:
     path = _quota_circuit_path()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
+        if path.stat().st_size > _QUOTA_CIRCUIT_MAX_BYTES:
+            raise _QuotaCircuitStateError("Quota circuit file exceeds size limit")
+        raw = path.read_text(encoding="utf-8")
+        if len(raw) > _QUOTA_CIRCUIT_MAX_BYTES:
+            raise _QuotaCircuitStateError("Quota circuit file exceeds size limit")
+        os.chmod(path, 0o600)
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise _QuotaCircuitStateError("Quota circuit file is unreadable") from exc
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise _QuotaCircuitStateError("Quota circuit file is invalid JSON") from exc
     entries = data.get("entries") if isinstance(data, dict) else None
-    return entries if isinstance(entries, dict) else {}
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(entries, dict)
+    ):
+        raise _QuotaCircuitStateError("Quota circuit schema is invalid")
+    if len(entries) > _QUOTA_CIRCUIT_MAX_RAW_ENTRIES:
+        raise _QuotaCircuitStateError("Quota circuit entry count exceeds limit")
+    return entries
 
 
 def _save_quota_circuits(entries: Dict[str, Dict[str, Any]]) -> None:
@@ -243,6 +307,7 @@ def _save_quota_circuits(entries: Dict[str, Dict[str, Any]]) -> None:
     )
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(tmp, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"version": 1, "entries": entries}, handle, sort_keys=True)
             handle.flush()
@@ -259,13 +324,42 @@ def _prune_quota_circuits(
     entries: Dict[str, Dict[str, Any]], *, now: Optional[float] = None
 ) -> Dict[str, Dict[str, Any]]:
     current = time.time() if now is None else now
-    active = {
-        key: value
-        for key, value in entries.items()
-        if isinstance(value, dict)
-        and isinstance(value.get("reset_at"), (int, float))
-        and float(value["reset_at"]) > current
+    active: Dict[str, Dict[str, Any]] = {}
+    persisted_fields = {
+        "code",
+        "provider",
+        "model",
+        "route",
+        "reset_at",
+        "retry_after",
+        "api_calls",
+        "fallback_policy",
+        "fallback_requires_approval",
+        "credential",
+        "recorded_at",
     }
+    for key, value in entries.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise _QuotaCircuitStateError("Quota circuit entry shape is invalid")
+        reset_at = value.get("reset_at")
+        recorded_at = value.get("recorded_at")
+        if (
+            isinstance(reset_at, bool)
+            or not isinstance(reset_at, (int, float))
+            or not math.isfinite(float(reset_at))
+            or isinstance(recorded_at, bool)
+            or not isinstance(recorded_at, (int, float))
+            or not math.isfinite(float(recorded_at))
+            or value.get("code") != "DELEGATION_BLOCKED_QUOTA"
+        ):
+            raise _QuotaCircuitStateError("Quota circuit entry values are invalid")
+        if float(reset_at) <= current:
+            continue
+        active[key] = {
+            field: value[field]
+            for field in persisted_fields
+            if field in value
+        }
     if len(active) <= _QUOTA_CIRCUIT_MAX_ENTRIES:
         return active
     newest = sorted(
@@ -279,8 +373,9 @@ def _prune_quota_circuits(
 def _record_delegation_quota_circuit(
     child: Any, metadata: Dict[str, Any]
 ) -> None:
-    reset_at = metadata.get("reset_at")
-    if not isinstance(reset_at, (int, float)) or float(reset_at) <= time.time():
+    now = time.time()
+    reset_at = _coerce_quota_reset_at(metadata.get("reset_at"), now=now)
+    if reset_at is None or reset_at <= now:
         return
     with _quota_circuit_lock:
         with _quota_circuit_file_lock():
@@ -305,6 +400,11 @@ def _record_delegation_quota_circuit(
                 for key in persisted_fields
                 if key in metadata
             }
+            entry["reset_at"] = reset_at
+            entry["retry_after"] = min(
+                max(0.0, reset_at - now),
+                _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS,
+            )
             entry["credential"] = _delegation_credential_bucket(child)
             entry["recorded_at"] = time.time()
             entries[_delegation_quota_bucket(child)] = entry
@@ -327,7 +427,9 @@ def _coerce_quota_seconds(value: Any) -> Optional[float]:
         seconds = float(value)
     except (TypeError, ValueError):
         return None
-    return seconds if seconds > 0 else None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, float(_QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS))
 
 
 def _coerce_quota_reset_at(value: Any, *, now: float) -> Optional[float]:
@@ -335,16 +437,22 @@ def _coerce_quota_reset_at(value: Any, *, now: float) -> Optional[float]:
     if numeric is not None:
         if numeric > 10_000_000_000:
             numeric /= 1000.0
-        return numeric if numeric > now else now + numeric
+        reset_at = numeric if numeric > now else now + numeric
+        return min(reset_at, now + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS)
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
         except ValueError:
-            return None
+            try:
+                parsed = parsedate_to_datetime(value.strip())
+            except (TypeError, ValueError, OverflowError):
+                return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         timestamp = parsed.timestamp()
-        return timestamp if timestamp > now else None
+        if not math.isfinite(timestamp) or timestamp <= now:
+            return None
+        return min(timestamp, now + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS)
     return None
 
 
@@ -424,7 +532,11 @@ def _build_delegation_quota_handler(child: Any):
         }
         if metadata["fallback_policy"] == "ask":
             metadata["fallback_requires_approval"] = True
-        _record_delegation_quota_circuit(child, metadata)
+        try:
+            _record_delegation_quota_circuit(child, metadata)
+        except (_QuotaCircuitStateError, OSError) as exc:
+            logger.error("Delegation quota circuit persistence unavailable: %s", exc)
+            metadata["circuit_persistence"] = "unavailable"
         return metadata
 
     return _handle
@@ -2653,7 +2765,24 @@ def _run_single_child(
         )
 
     try:
-        active_quota = _active_delegation_quota_circuit(child)
+        try:
+            active_quota = _active_delegation_quota_circuit(child)
+        except (_QuotaCircuitStateError, OSError) as exc:
+            logger.error("Delegation quota circuit state unavailable: %s", exc)
+            return {
+                "task_index": task_index,
+                "status": "blocked",
+                "code": "DELEGATION_BLOCKED_QUOTA_STATE",
+                "summary": None,
+                "error": (
+                    "Delegation blocked because persistent quota state "
+                    "cannot be verified safely."
+                ),
+                "exit_reason": "quota_state_unavailable",
+                "api_calls": 0,
+                "duration_seconds": round(time.monotonic() - child_start, 2),
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         if active_quota is not None:
             active_quota["retry_after"] = max(
                 0.0, float(active_quota["reset_at"]) - time.time()

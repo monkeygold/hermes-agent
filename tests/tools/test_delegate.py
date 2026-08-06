@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -828,6 +829,111 @@ class TestDelegateTask(unittest.TestCase):
             self.assertNotIn(marker, persisted)
             self.assertNotIn("credential-secret", persisted)
             self.assertEqual(stat.S_IMODE(circuit_path.stat().st_mode), 0o600)
+
+    def test_corrupt_quota_circuit_blocks_without_provider_probe(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-corrupt"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        malformed_payloads = (
+            "{broken",
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": {
+                        "bucket": {
+                            "code": "DELEGATION_BLOCKED_QUOTA",
+                            "reset_at": time.time() + 3600,
+                            "recorded_at": "not-a-number",
+                        }
+                    },
+                }
+            ),
+        )
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload[:20]), tempfile.TemporaryDirectory() as tmp_dir:
+                circuit_path = Path(tmp_dir) / "quota-circuits.json"
+                circuit_path.write_text(payload, encoding="utf-8")
+                with patch(
+                    "tools.delegate_tool._quota_circuit_path",
+                    return_value=circuit_path,
+                ):
+                    result = _run_single_child(
+                        task_index=0,
+                        goal="must fail closed",
+                        child=child,
+                        parent_agent=_make_mock_parent(),
+                    )
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
+            self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_file_lock_uses_msvcrt_on_windows(self):
+        from tools.delegate_tool import _quota_circuit_file_lock
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_LOCK=1,
+            LK_UNLCK=2,
+            locking=MagicMock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ), patch("tools.delegate_tool.os.name", "nt"), patch.dict(
+                sys.modules, {"msvcrt": fake_msvcrt}
+            ):
+                with _quota_circuit_file_lock():
+                    pass
+
+        self.assertEqual(fake_msvcrt.locking.call_count, 2)
+        self.assertEqual(fake_msvcrt.locking.call_args_list[0].args[1:], (1, 1))
+        self.assertEqual(fake_msvcrt.locking.call_args_list[1].args[1:], (2, 1))
+
+    def test_quota_reset_parses_http_date_and_rejects_non_finite_values(self):
+        from email.utils import formatdate
+
+        from tools.delegate_tool import (
+            _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS,
+            _coerce_quota_reset_at,
+            _coerce_quota_seconds,
+            _quota_observation,
+        )
+
+        now = time.time()
+        http_date = formatdate(now + 3600, usegmt=True)
+        parsed = _coerce_quota_reset_at(http_date, now=now)
+
+        class _QuotaError(Exception):
+            response = types.SimpleNamespace(headers={"Retry-After": http_date})
+
+        observed_reset, observed_retry = _quota_observation(
+            _QuotaError("quota"),
+            {},
+        )
+
+        assert parsed is not None
+        assert observed_reset is not None
+        assert observed_retry is not None
+        self.assertGreater(parsed, now)
+        self.assertGreater(observed_reset, now)
+        self.assertGreater(observed_retry, 0)
+        self.assertLessEqual(parsed, now + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS)
+        self.assertIsNone(_coerce_quota_seconds("NaN"))
+        self.assertIsNone(_coerce_quota_seconds("1e309"))
+        self.assertIsNone(_coerce_quota_reset_at("1e309", now=now))
 
     def test_confirmed_quota_handler_emits_observable_bucket_metadata(self):
         from tools.delegate_tool import _build_delegation_quota_handler
