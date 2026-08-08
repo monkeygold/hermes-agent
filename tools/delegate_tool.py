@@ -17,19 +17,25 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import hashlib
 import json
 import logging
+import math
 import re
+import stat
 
 logger = logging.getLogger(__name__)
 import os
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
@@ -162,8 +168,402 @@ _MIN_SPAWN_DEPTH = 1
 # Operator-approved task routes. ``auto`` classifies the bounded task before
 # credentials are resolved; provider/model/effort still come from
 # ``delegation.routes`` so the runtime never invents a provider.
-_DELEGATION_ROUTES = frozenset({"auto", "kimi", "luna", "qoder"})
+_DELEGATION_ROUTE_CHOICES = ["auto", "kimi", "luna", "opencode", "deepseek"]
+_DELEGATION_ROUTES = frozenset(_DELEGATION_ROUTE_CHOICES)
 _UNSET = object()
+
+_QUOTA_CIRCUIT_MAX_ENTRIES = 256
+_QUOTA_CIRCUIT_MAX_RAW_ENTRIES = 1024
+_QUOTA_CIRCUIT_MAX_BYTES = 1_048_576
+# Weekly/monthly provider limits need a long-lived breaker, but malformed
+# headers must never create a permanent bucket. One calendar month is the
+# finite upper bound for a single observed cooldown.
+_QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS = 31 * 24 * 60 * 60
+_quota_circuit_lock = threading.RLock()
+
+
+class _QuotaCircuitStateError(RuntimeError):
+    """The persistent quota state cannot be trusted or updated safely."""
+
+
+def _harden_quota_path(path: Any, mode: int) -> None:
+    """Apply and verify private POSIX modes; chmod failures are fatal everywhere."""
+    try:
+        os.chmod(path, mode)
+        if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != mode:
+            raise OSError("quota state path mode verification failed")
+    except OSError as exc:
+        raise _QuotaCircuitStateError(
+            "Quota circuit path permissions cannot be secured"
+        ) from exc
+
+
+def _quota_circuit_path():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "delegation" / "quota-circuits.json"
+
+
+@contextmanager
+def _quota_circuit_file_lock():
+    """Serialize persistent breaker updates across local Hermes processes."""
+    lock_path = _quota_circuit_path().with_suffix(".lock")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _harden_quota_path(lock_path.parent, 0o700)
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise _QuotaCircuitStateError("Quota circuit lock cannot be opened") from exc
+    try:
+        _harden_quota_path(lock_path, 0o600)
+    except Exception:
+        os.close(lock_fd)
+        raise
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as handle:
+        if os.name == "nt":
+            try:
+                import msvcrt
+            except ImportError as exc:  # pragma: no cover - defensive
+                raise _QuotaCircuitStateError(
+                    "Windows quota circuit locking is unavailable"
+                ) from exc
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError as exc:
+                raise _QuotaCircuitStateError(
+                    "Windows quota circuit locking failed"
+                ) from exc
+            return
+
+        try:
+            import fcntl
+        except ImportError as exc:  # pragma: no cover - unsupported POSIX
+            raise _QuotaCircuitStateError(
+                "Quota circuit locking is unavailable"
+            ) from exc
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise _QuotaCircuitStateError("Quota circuit locking failed") from exc
+
+
+def _delegation_credential_bucket(child: Any) -> str:
+    leased = getattr(child, "_delegation_credential_id", None)
+    if isinstance(leased, str) and leased:
+        return f"pool:{leased}"
+    secret = getattr(child, "api_key", None)
+    if not isinstance(secret, str) or not secret:
+        client_kwargs = getattr(child, "_client_kwargs", None)
+        secret = client_kwargs.get("api_key") if isinstance(client_kwargs, dict) else None
+    if isinstance(secret, str) and secret:
+        return "key:" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
+    return "credential:default"
+
+
+def _delegation_quota_bucket(child: Any) -> str:
+    identity = "\0".join(
+        (
+            str(getattr(child, "provider", None) or ""),
+            str(getattr(child, "model", None) or ""),
+            _delegation_credential_bucket(child),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _load_quota_circuits() -> Dict[str, Dict[str, Any]]:
+    path = _quota_circuit_path()
+    try:
+        if path.stat().st_size > _QUOTA_CIRCUIT_MAX_BYTES:
+            raise _QuotaCircuitStateError("Quota circuit file exceeds size limit")
+        raw = path.read_text(encoding="utf-8")
+        if len(raw) > _QUOTA_CIRCUIT_MAX_BYTES:
+            raise _QuotaCircuitStateError("Quota circuit file exceeds size limit")
+        _harden_quota_path(path, 0o600)
+    except FileNotFoundError:
+        return {}
+    except UnicodeError as exc:
+        raise _QuotaCircuitStateError("Quota circuit file is not valid UTF-8") from exc
+    except OSError as exc:
+        raise _QuotaCircuitStateError("Quota circuit file is unreadable") from exc
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise _QuotaCircuitStateError("Quota circuit file is invalid JSON") from exc
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(entries, dict)
+    ):
+        raise _QuotaCircuitStateError("Quota circuit schema is invalid")
+    if len(entries) > _QUOTA_CIRCUIT_MAX_RAW_ENTRIES:
+        raise _QuotaCircuitStateError("Quota circuit entry count exceeds limit")
+    return entries
+
+
+def _save_quota_circuits(entries: Dict[str, Dict[str, Any]]) -> None:
+    path = _quota_circuit_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _harden_quota_path(path.parent, 0o700)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            _harden_quota_path(tmp, 0o600)
+        except Exception:
+            os.close(fd)
+            raise
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "entries": entries}, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _harden_quota_path(path, 0o600)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _prune_quota_circuits(
+    entries: Dict[str, Dict[str, Any]], *, now: Optional[float] = None
+) -> Dict[str, Dict[str, Any]]:
+    current = time.time() if now is None else now
+    active: Dict[str, Dict[str, Any]] = {}
+    persisted_fields = {"code", "reset_at", "recorded_at"}
+    for key, value in entries.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise _QuotaCircuitStateError("Quota circuit entry shape is invalid")
+        reset_at = value.get("reset_at")
+        recorded_at = value.get("recorded_at")
+        if (
+            isinstance(reset_at, bool)
+            or not isinstance(reset_at, (int, float))
+            or isinstance(recorded_at, bool)
+            or not isinstance(recorded_at, (int, float))
+        ):
+            raise _QuotaCircuitStateError("Quota circuit entry values are invalid")
+        try:
+            reset_number = float(reset_at)
+            recorded_number = float(recorded_at)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise _QuotaCircuitStateError(
+                "Quota circuit entry values are invalid"
+            ) from exc
+        if (
+            not math.isfinite(reset_number)
+            or not math.isfinite(recorded_number)
+            or recorded_number <= 0
+            or recorded_number > current + 300
+            or reset_number
+            > recorded_number + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS
+            or reset_number > current + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS
+            or value.get("code") != "DELEGATION_BLOCKED_QUOTA"
+        ):
+            raise _QuotaCircuitStateError("Quota circuit entry values are invalid")
+        if reset_number <= current:
+            continue
+        active[key] = {
+            field: value[field]
+            for field in persisted_fields
+            if field in value
+        }
+    if len(active) <= _QUOTA_CIRCUIT_MAX_ENTRIES:
+        return active
+    newest = sorted(
+        active.items(),
+        key=lambda item: float(item[1].get("recorded_at", 0.0)),
+        reverse=True,
+    )[:_QUOTA_CIRCUIT_MAX_ENTRIES]
+    return dict(newest)
+
+
+def _record_delegation_quota_circuit(
+    child: Any, metadata: Dict[str, Any]
+) -> None:
+    now = time.time()
+    reset_at = _coerce_quota_reset_at(metadata.get("reset_at"), now=now)
+    if reset_at is None or reset_at <= now:
+        return
+    with _quota_circuit_lock:
+        with _quota_circuit_file_lock():
+            entries = _prune_quota_circuits(_load_quota_circuits())
+            # Persist only the fields needed to enforce and explain the
+            # cooldown. Provider error messages are intentionally excluded:
+            # upstream exceptions can echo request headers, endpoint query
+            # parameters, or other credential-bearing text.
+            persisted_fields = {"code", "reset_at"}
+            entry = {
+                key: metadata[key]
+                for key in persisted_fields
+                if key in metadata
+            }
+            entry["reset_at"] = reset_at
+            entry["recorded_at"] = time.time()
+            entries[_delegation_quota_bucket(child)] = entry
+            _save_quota_circuits(_prune_quota_circuits(entries))
+
+
+def _active_delegation_quota_circuit(child: Any) -> Optional[Dict[str, Any]]:
+    with _quota_circuit_lock:
+        with _quota_circuit_file_lock():
+            raw = _load_quota_circuits()
+            entries = _prune_quota_circuits(raw)
+            if entries != raw:
+                _save_quota_circuits(entries)
+            entry = entries.get(_delegation_quota_bucket(child))
+            if not isinstance(entry, dict):
+                return None
+            active = dict(entry)
+            active.update(
+                {
+                    "provider": str(getattr(child, "provider", None) or ""),
+                    "model": str(getattr(child, "model", None) or ""),
+                    "route": getattr(child, "_delegate_route", None),
+                    "fallback_policy": getattr(
+                        child, "_delegation_fallback_policy", "strict"
+                    ),
+                }
+            )
+            return active
+
+
+def _coerce_quota_seconds(value: Any) -> Optional[float]:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, float(_QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS))
+
+
+def _coerce_quota_reset_at(value: Any, *, now: float) -> Optional[float]:
+    numeric = _coerce_quota_seconds(value)
+    if numeric is not None:
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        reset_at = numeric if numeric > now else now + numeric
+        return min(reset_at, now + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value.strip())
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp = parsed.timestamp()
+        if not math.isfinite(timestamp) or timestamp <= now:
+            return None
+        return min(timestamp, now + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS)
+    return None
+
+
+def _quota_observation(api_error: Exception, error_context: Any) -> tuple[Optional[float], Optional[float]]:
+    now = time.time()
+    retry_after = _coerce_quota_seconds(getattr(api_error, "retry_after", None))
+    reset_at = None
+    response = getattr(api_error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        raw_retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        retry_after = retry_after or _coerce_quota_seconds(raw_retry_after)
+        if retry_after is None:
+            reset_at = _coerce_quota_reset_at(raw_retry_after, now=now)
+        raw_reset = (
+            headers.get("x-ratelimit-reset")
+            or headers.get("x-rate-limit-reset")
+            or headers.get("ratelimit-reset")
+        )
+        parsed_reset = _coerce_quota_reset_at(raw_reset, now=now)
+        if parsed_reset:
+            reset_at = parsed_reset
+    if isinstance(error_context, dict):
+        raw_reset = error_context.get("reset_at") or error_context.get("reset")
+        parsed_reset = _coerce_quota_reset_at(raw_reset, now=now)
+        if parsed_reset:
+            reset_at = parsed_reset
+        retry_after = retry_after or _coerce_quota_seconds(
+            error_context.get("retry_after")
+        )
+    if reset_at is None and retry_after is not None:
+        reset_at = now + retry_after
+    if retry_after is None and reset_at is not None:
+        retry_after = max(0.0, reset_at - now)
+    return reset_at, retry_after
+
+
+def _build_delegation_quota_handler(child: Any):
+    def _handle(*, api_error, classified, error_context, api_call_count):
+        reason = getattr(getattr(classified, "reason", None), "value", "")
+        context_message = (
+            error_context.get("message", "")
+            if isinstance(error_context, dict)
+            else ""
+        )
+        context_reason = (
+            error_context.get("reason", "")
+            if isinstance(error_context, dict)
+            else ""
+        )
+        text = f"{api_error} {context_message} {context_reason}".casefold()
+        confirmed = (
+            "weekly usage limit" in text
+            or "weekly limit" in text
+            or "quota exhausted" in text
+            or "quota has been exhausted" in text
+            or "quota exceeded" in text
+            or "exceeded your current quota" in text
+            or "insufficient_quota" in text
+            or "usage limit reached" in text
+        )
+        if reason not in {"rate_limit", "upstream_rate_limit", "billing"} or not confirmed:
+            return None
+        reset_at, retry_after = _quota_observation(api_error, error_context)
+        metadata = {
+            "code": "DELEGATION_BLOCKED_QUOTA",
+            "provider": str(getattr(child, "provider", None) or ""),
+            "model": str(getattr(child, "model", None) or ""),
+            "route": getattr(child, "_delegate_route", None),
+            "reset_at": reset_at,
+            "retry_after": retry_after,
+            "api_calls": int(api_call_count or 0),
+            "message": str(context_message or api_error),
+            "fallback_policy": getattr(
+                child, "_delegation_fallback_policy", "strict"
+            ),
+        }
+        if metadata["fallback_policy"] == "ask":
+            metadata["fallback_requires_approval"] = True
+        try:
+            _record_delegation_quota_circuit(child, metadata)
+        except (_QuotaCircuitStateError, OSError) as exc:
+            logger.error("Delegation quota circuit persistence unavailable: %s", exc)
+            metadata["circuit_persistence"] = "unavailable"
+        return metadata
+
+    return _handle
 # No upper ceiling on spawn depth — like max_concurrent_children, depth has a
 # floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
 # stays flat (MAX_DEPTH = 1); raising the config knob is an explicit opt-in.
@@ -1483,7 +1883,23 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    parent_sandbox = getattr(parent_agent, "_delegate_sandbox", None)
+    verified_parent_workspace = None
+    if (
+        getattr(parent_agent, "_delegate_sandbox_verified", False) is True
+        and isinstance(parent_sandbox, dict)
+    ):
+        raw_host_workspace = parent_sandbox.get("host_workspace")
+        if isinstance(raw_host_workspace, str) and raw_host_workspace.strip():
+            verified_parent_workspace = raw_host_workspace
+    # A nested child sees /workspace as its container cwd.  That path must
+    # never be resolved on the host; reuse only the parent sandbox's attested
+    # host mount.  First-level children still use the normal host-side hints.
+    workspace_hint = (
+        verified_parent_workspace
+        if verified_parent_workspace is not None
+        else _resolve_workspace_hint(parent_agent)
+    )
     sandbox_plan = _resolve_subagent_sandbox(
         delegation_cfg, route, workspace_hint
     )
@@ -1623,12 +2039,22 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Legacy single-route installations inherit the parent's fallback chain.
-    # A child selected from delegation.routes is operator-pinned and must not
-    # silently switch to any provider from the parent chain.
+    fallback_policy = str(
+        delegation_cfg.get("fallback_policy") or "strict"
+    ).strip().lower()
+    if fallback_policy not in {"strict", "ask", "allow"}:
+        logger.warning(
+            "Unknown delegation.fallback_policy=%r; using strict",
+            fallback_policy,
+        )
+        fallback_policy = "strict"
+    # Fallback is disabled by default. ``ask`` also stays fail-closed because
+    # subagents cannot interact with the user; the blocked result tells the
+    # parent that approval is required. Exact configured routes remain pinned
+    # under every policy and can never become a degraded success.
     parent_fallback = (
         (getattr(parent_agent, "_fallback_chain", None) or None)
-        if inherit_parent_fallback
+        if inherit_parent_fallback and fallback_policy == "allow"
         else []
     )
 
@@ -1721,6 +2147,14 @@ def _build_child_agent(
     child._delegate_role = effective_role
     child._delegate_route = route
     child._delegate_sandbox = sandbox_plan
+    setattr(child, "_delegate_sandbox_verified", False)
+    setattr(child, "_delegation_fallback_policy", fallback_policy)
+    setattr(
+        child,
+        "_delegation_fallback_available",
+        bool(inherit_parent_fallback and getattr(parent_agent, "_fallback_chain", None)),
+    )
+    setattr(child, "_delegation_quota_handler", _build_delegation_quota_handler(child))
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -2234,6 +2668,7 @@ def _run_single_child(
     leased_cred_id = None
     if child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
+        setattr(child, "_delegation_credential_id", leased_cred_id)
         if leased_cred_id is not None:
             try:
                 leased_entry = child_pool.current()
@@ -2354,6 +2789,45 @@ def _run_single_child(
         )
 
     try:
+        try:
+            active_quota = _active_delegation_quota_circuit(child)
+        except (_QuotaCircuitStateError, OSError) as exc:
+            logger.error("Delegation quota circuit state unavailable: %s", exc)
+            return {
+                "task_index": task_index,
+                "status": "blocked",
+                "code": "DELEGATION_BLOCKED_QUOTA_STATE",
+                "summary": None,
+                "error": (
+                    "Delegation blocked because persistent quota state "
+                    "cannot be verified safely."
+                ),
+                "exit_reason": "quota_state_unavailable",
+                "api_calls": 0,
+                "duration_seconds": round(time.monotonic() - child_start, 2),
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
+        if active_quota is not None:
+            active_quota["retry_after"] = max(
+                0.0, float(active_quota["reset_at"]) - time.time()
+            )
+            active_quota["api_calls"] = 0
+            active_quota["from_circuit_breaker"] = True
+            if getattr(child, "_delegation_fallback_policy", "strict") == "ask":
+                active_quota["fallback_requires_approval"] = True
+            return {
+                "task_index": task_index,
+                "status": "blocked",
+                "code": "DELEGATION_BLOCKED_QUOTA",
+                "summary": None,
+                "error": active_quota.get("message")
+                or "Delegation blocked by confirmed provider quota cooldown.",
+                "exit_reason": "quota",
+                "api_calls": 0,
+                "duration_seconds": round(time.monotonic() - child_start, 2),
+                **active_quota,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         _heartbeat_thread.start()
         if child_progress_cb:
             try:
@@ -2441,6 +2915,8 @@ def _run_single_child(
             try:
                 if sandbox_registered:
                     _verify_child_sandbox(child_task_id, sandbox_plan)
+                    sandbox_verified = True
+                    setattr(child, "_delegate_sandbox_verified", True)
                     _subagent_sandbox_runtime.active = True
                     logger.info(
                         "Subagent %d Docker sandbox verified for %s",
@@ -2614,6 +3090,7 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
+        delegation_quota = result.get("delegation_quota")
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
@@ -2718,6 +3195,26 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if isinstance(delegation_quota, dict):
+            entry.update(delegation_quota)
+            entry["code"] = "DELEGATION_BLOCKED_QUOTA"
+            entry["exit_reason"] = "quota"
+            entry["error"] = delegation_quota.get("message") or result.get(
+                "error", "Delegation blocked by confirmed provider quota."
+            )
+        elif (
+            status == "failed"
+            and getattr(child, "_delegation_fallback_policy", "strict") == "ask"
+            and getattr(child, "_delegation_fallback_available", False)
+        ):
+            status = "blocked"
+            entry["status"] = "blocked"
+            entry["code"] = "DELEGATION_BLOCKED_FALLBACK_APPROVAL"
+            entry["exit_reason"] = "fallback_approval_required"
+            entry["fallback_requires_approval"] = True
+            entry["error"] = result.get("error") or (
+                "Delegation route failed; fallback requires explicit approval."
+            )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 

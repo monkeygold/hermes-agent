@@ -2715,6 +2715,38 @@ def run_conversation(
                     reason=classified.reason.value,
                 )
 
+                # Delegated children may install a quota stop hook.  It is
+                # intentionally evaluated before credential rotation,
+                # fallback, retry counters, or backoff: a confirmed periodic
+                # quota with an observable cooldown is not recoverable by
+                # repeating the same provider/model/credential bucket.
+                _delegation_quota_handler = getattr(
+                    agent, "_delegation_quota_handler", None
+                )
+                if callable(_delegation_quota_handler):
+                    _delegation_quota = _delegation_quota_handler(
+                        api_error=api_error,
+                        classified=classified,
+                        error_context=error_context,
+                        api_call_count=api_call_count,
+                    )
+                    if _delegation_quota:
+                        _quota_message = str(
+                            _delegation_quota.get("message")
+                            or "Delegation blocked by confirmed provider quota."
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": "",
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _quota_message,
+                            "partial": True,
+                            "failure_reason": "delegation_quota",
+                            "delegation_quota": _delegation_quota,
+                        }
+
                 if (
                     classified.reason == FailoverReason.billing
                     and _is_nous_inference_route(

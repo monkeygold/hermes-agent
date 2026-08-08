@@ -11,6 +11,10 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
 import threading
 import time
 import types
@@ -399,6 +403,40 @@ class TestSubagentSandboxPlan(unittest.TestCase):
         cfg = {"sandbox": {"enabled": True, "auto_approve": True}}
         self.assertIsNone(_resolve_subagent_sandbox(cfg, "kimi", "/root"))
 
+    @patch("tools.delegate_tool._resolve_git_workspace", return_value="/srv/alpha-lab")
+    @patch("run_agent.AIAgent")
+    def test_nested_sandbox_reuses_verified_parent_host_workspace(
+        self, MockAgent, mock_git
+    ):
+        parent = _make_mock_parent(depth=1)
+        parent._delegate_sandbox = {
+            "backend": "docker",
+            "host_workspace": "/srv/alpha-lab",
+            "network": False,
+        }
+        parent._delegate_sandbox_verified = True
+        parent.cwd = "/workspace"
+        MockAgent.return_value = MagicMock()
+
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"sandbox": {"enabled": True, "backend": "docker"}},
+        ), patch("tools.delegate_tool._get_max_spawn_depth", return_value=3):
+            child = _build_child_agent(
+                task_index=0,
+                goal="Inspect Alpha-Lab",
+                context=None,
+                toolsets=None,
+                model="test-model",
+                max_iterations=3,
+                parent_agent=parent,
+                task_count=1,
+                route="luna",
+            )
+
+        mock_git.assert_called_once_with("/srv/alpha-lab")
+        self.assertEqual(child._delegate_sandbox["host_workspace"], "/srv/alpha-lab")
+
     @patch("tools.terminal_tool.terminal_tool")
     @patch("tools.terminal_tool.get_active_env")
     def test_runtime_attestation_requires_restricted_docker(
@@ -694,6 +732,416 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(goal="Break things", parent_agent=parent))
         self.assertEqual(result["results"][0]["status"], "error")
         self.assertIn("Something broke", result["results"][0]["error"])
+
+    def test_persisted_quota_circuit_blocks_same_bucket_without_probe(self):
+        from tools.delegate_tool import (
+            _active_delegation_quota_circuit,
+            _record_delegation_quota_circuit,
+            _run_single_child,
+        )
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-a"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        _record_delegation_quota_circuit(
+            child,
+            {
+                "code": "DELEGATION_BLOCKED_QUOTA",
+                "provider": child.provider,
+                "model": child.model,
+                "route": "luna",
+                "reset_at": time.time() + 3600,
+                "retry_after": 3600.0,
+                "api_calls": 1,
+                "message": "weekly quota exhausted",
+            },
+        )
+
+        for variant in (
+            types.SimpleNamespace(
+                provider="other-provider",
+                model=child.model,
+                api_key=child.api_key,
+            ),
+            types.SimpleNamespace(
+                provider=child.provider,
+                model="other-model",
+                api_key=child.api_key,
+            ),
+            types.SimpleNamespace(
+                provider=child.provider,
+                model=child.model,
+                api_key="other-credential",
+            ),
+        ):
+            self.assertIsNone(_active_delegation_quota_circuit(variant))
+
+        result = _run_single_child(
+            task_index=0,
+            goal="must not probe",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA")
+        self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_circuit_cache_is_private_and_omits_raw_error_message(self):
+        from tools.delegate_tool import _record_delegation_quota_circuit
+
+        child = types.SimpleNamespace(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            api_key="credential-secret",
+        )
+        marker = "FAKE_SECRET_MARKER_DO_NOT_PERSIST"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ):
+                _record_delegation_quota_circuit(
+                    child,
+                    {
+                        "code": "DELEGATION_BLOCKED_QUOTA",
+                        "provider": child.provider,
+                        "model": child.model,
+                        "reset_at": time.time() + 3600,
+                        "retry_after": 3600.0,
+                        "api_calls": 1,
+                        "message": f"weekly quota exhausted: {marker}",
+                    },
+                )
+
+            persisted = circuit_path.read_text(encoding="utf-8")
+            self.assertNotIn(marker, persisted)
+            self.assertNotIn("credential-secret", persisted)
+            self.assertEqual(stat.S_IMODE(circuit_path.stat().st_mode), 0o600)
+
+    def test_corrupt_quota_circuit_blocks_without_provider_probe(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-corrupt"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        huge_integer = "9" * 4000
+        malformed_payloads = (
+            b"\xff",
+            b"{broken",
+            (
+                '{"version":1,"entries":{"bucket":'
+                '{"code":"DELEGATION_BLOCKED_QUOTA",'
+                f'"reset_at":{huge_integer},"recorded_at":1}}}}'
+            ).encode(),
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": {
+                        "bucket": {
+                            "code": "DELEGATION_BLOCKED_QUOTA",
+                            "reset_at": time.time() + (40 * 24 * 60 * 60),
+                            "recorded_at": time.time(),
+                        }
+                    },
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": {
+                        "bucket": {
+                            "code": "DELEGATION_BLOCKED_QUOTA",
+                            "reset_at": time.time() + 3600,
+                            "recorded_at": "not-a-number",
+                        }
+                    },
+                }
+            ).encode(),
+        )
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload[:20]), tempfile.TemporaryDirectory() as tmp_dir:
+                circuit_path = Path(tmp_dir) / "quota-circuits.json"
+                circuit_path.write_bytes(payload)
+                with patch(
+                    "tools.delegate_tool._quota_circuit_path",
+                    return_value=circuit_path,
+                ):
+                    result = _run_single_child(
+                        task_index=0,
+                        goal="must fail closed",
+                        child=child,
+                        parent_agent=_make_mock_parent(),
+                    )
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
+            self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_circuit_json_recursion_fails_closed(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-recursion"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            circuit_path.write_text('{"version":1,"entries":{}}')
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ), patch(
+                "tools.delegate_tool.json.loads",
+                side_effect=RecursionError("too deep"),
+            ):
+                result = _run_single_child(
+                    task_index=0,
+                    goal="must fail closed",
+                    child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
+        self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_circuit_permission_hardening_failure_blocks(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-permissions"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ), patch(
+                "tools.delegate_tool.os.chmod",
+                side_effect=PermissionError("denied"),
+            ):
+                result = _run_single_child(
+                    task_index=0,
+                    goal="must fail closed",
+                    child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA_STATE")
+        self.assertEqual(result["api_calls"], 0)
+        child.run_conversation.assert_not_called()
+
+    def test_legacy_quota_cache_drops_credential_before_returning(self):
+        from tools.delegate_tool import (
+            _delegation_quota_bucket,
+            _run_single_child,
+        )
+
+        child = MagicMock()
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-luna"
+        child.api_key = "credential-legacy"
+        child._credential_pool = None
+        child._delegate_route = "luna"
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "strict"
+        marker = "FAKE_LEGACY_SECRET"
+        now = time.time()
+        payload = {
+            "version": 1,
+            "entries": {
+                _delegation_quota_bucket(child): {
+                    "code": "DELEGATION_BLOCKED_QUOTA",
+                    "reset_at": now + 3600,
+                    "recorded_at": now,
+                    "credential": marker,
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            circuit_path.write_text(json.dumps(payload))
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ):
+                result = _run_single_child(
+                    task_index=0,
+                    goal="must fail from sanitized cache",
+                    child=child,
+                    parent_agent=_make_mock_parent(),
+                )
+            persisted = circuit_path.read_text()
+
+        self.assertEqual(result["code"], "DELEGATION_BLOCKED_QUOTA")
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertNotIn(marker, persisted)
+        child.run_conversation.assert_not_called()
+
+    def test_quota_file_lock_uses_msvcrt_on_windows(self):
+        from tools.delegate_tool import _quota_circuit_file_lock
+
+        fake_msvcrt = types.SimpleNamespace(
+            LK_LOCK=1,
+            LK_UNLCK=2,
+            locking=MagicMock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            circuit_path = Path(tmp_dir) / "quota-circuits.json"
+            with patch(
+                "tools.delegate_tool._quota_circuit_path",
+                return_value=circuit_path,
+            ), patch("tools.delegate_tool.os.name", "nt"), patch.dict(
+                sys.modules, {"msvcrt": fake_msvcrt}
+            ):
+                with _quota_circuit_file_lock():
+                    pass
+
+        self.assertEqual(fake_msvcrt.locking.call_count, 2)
+        self.assertEqual(fake_msvcrt.locking.call_args_list[0].args[1:], (1, 1))
+        self.assertEqual(fake_msvcrt.locking.call_args_list[1].args[1:], (2, 1))
+
+    def test_quota_reset_parses_http_date_and_rejects_non_finite_values(self):
+        from email.utils import formatdate
+
+        from tools.delegate_tool import (
+            _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS,
+            _coerce_quota_reset_at,
+            _coerce_quota_seconds,
+            _quota_observation,
+        )
+
+        now = time.time()
+        http_date = formatdate(now + 3600, usegmt=True)
+        parsed = _coerce_quota_reset_at(http_date, now=now)
+
+        class _QuotaError(Exception):
+            response = types.SimpleNamespace(headers={"Retry-After": http_date})
+
+        observed_reset, observed_retry = _quota_observation(
+            _QuotaError("quota"),
+            {},
+        )
+
+        assert parsed is not None
+        assert observed_reset is not None
+        assert observed_retry is not None
+        self.assertGreater(parsed, now)
+        self.assertGreater(observed_reset, now)
+        self.assertGreater(observed_retry, 0)
+        self.assertLessEqual(parsed, now + _QUOTA_CIRCUIT_MAX_COOLDOWN_SECONDS)
+        self.assertIsNone(_coerce_quota_seconds("NaN"))
+        self.assertIsNone(_coerce_quota_seconds("1e309"))
+        self.assertIsNone(_coerce_quota_reset_at("1e309", now=now))
+
+    def test_confirmed_quota_handler_emits_observable_bucket_metadata(self):
+        from tools.delegate_tool import _build_delegation_quota_handler
+
+        child = types.SimpleNamespace(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            api_key="credential-b",
+            _delegate_route="luna",
+            _delegation_fallback_policy="ask",
+        )
+        handler = _build_delegation_quota_handler(child)
+        classified = types.SimpleNamespace(
+            reason=types.SimpleNamespace(value="rate_limit")
+        )
+
+        metadata = handler(
+            api_error=RuntimeError("provider request failed"),
+            classified=classified,
+            error_context={
+                "message": "weekly usage limit reached",
+                "reason": "insufficient_quota",
+                "reset_at": time.time() + 7200,
+            },
+            api_call_count=1,
+        )
+
+        self.assertEqual(metadata["code"], "DELEGATION_BLOCKED_QUOTA")
+        self.assertEqual(metadata["provider"], "openai-codex")
+        self.assertEqual(metadata["model"], "gpt-5.6-luna")
+        self.assertEqual(metadata["route"], "luna")
+        self.assertEqual(metadata["api_calls"], 1)
+        self.assertGreater(metadata["retry_after"], 0)
+        self.assertEqual(metadata["message"], "weekly usage limit reached")
+        self.assertTrue(metadata["fallback_requires_approval"])
+
+    def test_ask_policy_returns_approval_gate_instead_of_degraded_success(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.provider = "ask-provider"
+        child.model = "ask-model"
+        child.api_key = "ask-credential"
+        child._credential_pool = None
+        child._delegate_route = None
+        child._delegate_role = "leaf"
+        child._delegate_sandbox = None
+        child._subagent_id = None
+        child._delegation_fallback_policy = "ask"
+        child._delegation_fallback_available = True
+        child.run_conversation.return_value = {
+            "final_response": "",
+            "completed": False,
+            "api_calls": 1,
+            "messages": [],
+            "error": "primary route failed",
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="ask before fallback",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["code"], "DELEGATION_BLOCKED_FALLBACK_APPROVAL"
+        )
+        self.assertTrue(result["fallback_requires_approval"])
 
     def test_depth_increments(self):
         """Verify child gets parent's depth + 1."""
@@ -3686,7 +4134,10 @@ class TestFallbackModelInheritance(unittest.TestCase):
         fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
         parent._fallback_chain = [fallback_entry]
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "allow"},
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
@@ -3702,12 +4153,86 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
 
+    def test_strict_fallback_policy_is_default_and_disables_parent_chain(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config", return_value={}
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="exact execution",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], [])
+
+    def test_ask_fallback_policy_does_not_switch_silently(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "ask"},
+        ):
+            child = _build_child_agent(
+                task_index=0,
+                goal="ask before fallback",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], [])
+        self.assertEqual(child._delegation_fallback_policy, "ask")
+
+    def test_allow_does_not_degrade_an_exact_route(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "allow"},
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="exact route gate",
+                context=None,
+                toolsets=None,
+                model="pinned-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                route="luna",
+                inherit_parent_fallback=False,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], [])
+
     def test_child_gets_no_fallback_when_parent_chain_empty(self):
         """When parent._fallback_chain is empty, fallback_model is None."""
         parent = _make_mock_parent(depth=0)
         parent._fallback_chain = []
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config",
+            return_value={"fallback_policy": "allow"},
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
